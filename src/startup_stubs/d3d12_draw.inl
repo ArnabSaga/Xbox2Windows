@@ -1117,5 +1117,14 @@ void __stdcall list_vertex_buffers(Wrapper* self, UINT start, UINT count, const 
 // List slot 13, DrawIndexedInstanced(index count, instances, start index, base vertex, start instance).
 void __stdcall list_draw_indexed(Wrapper* self, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
 {
-    InterlockedIncrement(draw_translated(self, true, count, instances, start, base_vertex, start_instance) ? &translated_draws : &untranslated_draws);
+    Pass& pass = pass_of(self);
+    if (pass.pipeline_class == PipelineClass::compute) {
+        static LONG compute_draws;
+        if (first_calls(compute_draws, 4)) log("x2w-render DrawIndexedInstanced(%u, %u, %u, %d, %u) skipped: a compute pipeline is bound",
+                                              count, instances, start, base_vertex, start_instance);
+        InterlockedIncrement(&render_draws_skipped);
+        return;
+    }
+    InterlockedIncrement(draw_translated(self, true, count, instances, start, base_vertex, start_instance) ? &translated_draws
+                                                                                                          : &untranslated_draws);
 }

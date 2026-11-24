@@ -193,7 +193,7 @@ ctest --preset release --no-tests=error -R '^startup_launch$' -V
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` |
-| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>`, then replay the draw. |
+| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>`, then replay the draw. The same directory holds compute requests `req_<key>.cs` and their `<key>.cs.src` manifest; run `tools/dxil_retarget.py --pending <dir> --probe root_probe.exe`. |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. |
@@ -217,6 +217,103 @@ requests, run `python tools/startup/gfx2hlsl.py --pending <cache-directory>`,
 then start the build again. The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
 independent image descriptors at offsets 0 and 32 from the load address.
+
+## Compute dispatch
+
+With `X2W_D3D12_RENDER=1` and `X2W_D3D12_LIST_NOOP=1` (the pair the graphics render path already uses), device slot 62 (`D3D12_COMPUTE_PIPELINE_STATE_DESC`) reads a signed desktop container from `X2W_SHADER_CACHE`. The runtime key is FNV-1a 64 over `x2w-startup-compute-1` and the captured container bytes. A cache miss publishes `req_<key>.cs` and `req_<key>.cs.src` (the request manifest, written last); the offline pass is:
+
+```powershell
+python tools/dxil_retarget.py --pending <cache-directory> --probe root_probe.exe `
+    [--pso-probe root_device_probe.exe [--warp-only]]
+```
+
+The tool verifies the request filename against the container bytes, retargets, validates and gates
+the final module, signs it, and publishes `<key>.cs.cso` followed by `<key>.cs.manifest` (the cache
+manifest, written last). A permanent module refusal publishes `status refused`; a probe or I/O
+problem publishes `<key>.cs.error` and leaves the request queued. The runtime trusts only a manifest
+whose key, revision, source size, source SHA-256 and output SHA-256 agree. Missing, tampered,
+unsigned or contradictory artifacts stay placeholders and are logged with the reason. A manifest for
+another key, revision or source is ignored and a fresh request is published, so an old cache is
+replaced instead of being trusted.
+
+When `--pso-probe` is supplied, the pending pass requires a `<backend>_root` result and, when that
+root succeeded, a `<backend>_pso` result for every backend the probe mode promises. It inspects both
+HRESULTs and requires `0x00000000`; incomplete, contradictory, malformed or failed results publish
+`<key>.cs.error` and leave the request queued. A missing hardware adapter on a hardware-enabled probe
+is a retryable, separately named result. A container with no embedded `RTS0` part is an explicit
+`SKIPPED no embedded root signature` (the title supplies the root at Dispatch), decided from the
+signed container and never inferred from a failed root HRESULT. The cache manifest records
+`pso_probe PASSED`, `SKIPPED ...` or `NOT_RUN`; a signed manifest that reports `FAILED` is refused.
+An entry with the field absent (an older cache) remains valid, so no cache revision changed.
+
+Only root SRV, root UAV and root 32-bit constants are supported, in storage separate from the
+graphics eight-word constants (32 parameters by 64 values, and the fixture's full 16 constants). A
+pipeline whose root signature declares a descriptor table, a root CBV, more than 32 parameters or
+more than 64 constants is refused with a reason, and a compute pipeline without a root signature is
+refused because its root cannot be matched at Dispatch. This slice never derives a fallback root
+from the container: a root the shim did not create, or one whose parameters cannot be inspected, is
+refused, so no root identity is cached by a title pointer. Oversized or structurally unsupported
+parameter lists are kept out of the active binding state and leave a sticky refusal that a
+pipeline-class change cannot clear.
+
+A root 32-bit constants parameter must be fully initialized before Dispatch: the runtime tracks one
+bit per declared DWORD, so split and nonzero-offset writes accumulate and previously written values
+stay valid until the root signature changes, the list is Reset, or it is Closed. A Dispatch with a
+partially initialized parameter is refused. A pipeline-class change does not clear root arguments,
+matching D3D12. A root UAV must resolve to an aliased, device-owned placed buffer with
+`D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`; interior DWORD-aligned offsets are accepted, other
+interior or unaligned addresses are refused. Root SRVs use the aliased buffer when one is available
+and otherwise a retained upload copy. The upload copy is taken from at most 64 KiB of contiguous
+readable title memory (the root signature declares no size), so a shader that reads past that window
+is outside this slice. The retained-upload capacity (1024) is enforced atomically: the capacity
+check and a reservation share one lock, so concurrent recordings cannot overfill it, and a refused
+or failed allocation leaves no resource pointer behind. `X2W_TEST_COMPUTE_UPLOAD_LIMIT` may lower the
+bound for a boundary test; it can never raise it. Dispatch transitions resources, issues a UAV
+barrier before each dispatch, and keeps compute and graphics pipeline state separate.
+
+The source-built fixture is `startup_compute_{warp,hardware}`. It compiles
+`tests/startup_compute.hlsl`, wraps it as a synthetic `dxil-ms-xb2` container, runs the pending
+tool, dispatches through the wrapper and compares all 64 readback words. Missing cache, explicit
+refusal, tampered output, a wrong shader under the same key, missing root arguments, split and
+nonzero-offset constants, incomplete constants, invalid constant offset and count, a `0xFFFFFFFF`
+constant count, a manifest reporting a failed PSO probe, repeated dispatch, graphics/compute
+mismatch, Reset isolation, root-signature invalidation, invalid UAV placement, one resource bound as
+both SRV and UAV, a 34-parameter root, parameter index 31 versus 32, an unwrapped desktop root, the
+upload boundary, and a descriptor-table root signature are controls. The offline probe controls cover
+PASSED, stripped-root SKIPPED, NOT_RUN, missing/invalid/failed root and PSO results, malformed JSON
+and an absent hardware adapter. WARP or a physical adapter that does not report
+`D3D12_FEATURE_EXISTING_HEAPS` skips with 77.
+
+The slot numbers 33, 35, 37, 39, 41, 43 and 45 are inferred from the confirmed graphics mapping
+(+4 from the desktop slots 29, 31, 33, 35, 37, 39 and 41); they are pinned by the synthetic fixture,
+not by an observed title call site. The 43 captured modules that still call `xbox.*` intrinsics are
+refused, not lowered. Descriptor-table conversion and compute-to-graphics visibility in the same
+frame are not implemented.
+
+Measured on Windows 11 26300 with MSVC 19.44 and validator 1.9.2602.17: both WARP (10.0.26100.9818)
+and an Intel Iris Xe (31.0.101.5333) built the real PSO (`0x00000000`), dispatched, and matched all
+64 CPU-reference words for the full, split, reversed-offset and repeated-dispatch cases; every
+refusal control left the sentinel unchanged. With the Windows Graphics Tools capability installed,
+the D3D12 debug layer enabled on both adapters (`x2w-d3d12 debug layer: 0x00000000 enabled` is
+retained in the Stage 2J log) and reported zero messages for the fixture. Details are in
+`docs/experiments.md`.
+
+## Source-built native compute fixture
+
+A separate bounded fixture translates two source-built gfx1013 compute programs to desktop DXIL and
+executes them through this wrapper. It starts from assembled machine code, reuses
+`compute_store_aot.lower()` and the revision-2 native cache, and executes through the existing
+compute root binding and list slot 14 Dispatch. Activation is explicit:
+`X2W_NATIVE_COMPUTE_FIXTURE=1` plus one of the two approved keys, on top of the permissive, render
+and list-noop flags above. The internal path identity is 162; it is not an Xbox device slot. A
+fixture-only guard in `list_dispatch` checks the approved identity, real compute PSO, same device,
+matching root, all 16 constants, the record dimensions, the guard bound and the accessible
+SRV/UAV extents before any state transition or Dispatch. WARP and a physical adapter match all 320
+output words for the full, partial, zero, lower-cap, split-constant and repeated cases; the debug
+layer reports no messages. The protocol, exact reproduction commands, expected totals and
+limitations are in [docs/experiments.md](experiments.md#source-built-native-compute-fixture-execution-and-readback). This is not production
+slot 67 support: the slot 67 placeholder is unchanged, no title descriptor is parsed, and
+ExecuteIndirect and arbitrary native profiles are not implemented.
 
 ## Game saves
 
@@ -475,7 +572,10 @@ varying-source, register-clobber, mask and branch controls.
 `tools/startup/capture.py` reads the `capture.bin` the frame capture writes. A truncated file, a chunk
 with a short header, or an unknown tag raises a `ValueError` that names the tag and offset.
 `ctest --preset dev --no-tests=error -R '^startup_capture$' -V` checks every chunk layout against a
-synthetic file.
+synthetic file. The existing `PSO` chunk records the creating path and whether a real object exists,
+but it does not carry the pipeline class, the compute cache key or the compute root signature, so an
+offline reader cannot distinguish every slot-62 compute PSO from a graphics PSO. That is a deferred
+capture-format change, not a runtime claim.
 
 ## NV12 plane upload
 

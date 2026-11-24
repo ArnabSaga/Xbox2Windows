@@ -9536,3 +9536,241 @@ For the same nine-mip textures, slot 2 returns the byte offset of each mip withi
 cmake --build --preset release --target startup_stream_consumer startup_stub_xg_xs xg_swizzle_select_check
 ctest --preset release --no-tests=error --output-on-failure -R '^(startup_xg_bc_(array|chain)_(hardware|warp)|startup_xg_bc_tiling|xg_bc64_tiling_reference|startup_xg_bc7_layout)$'
 ```
+
+## Startup compute dispatch: signed retarget to a desktop PSO
+
+The permissive device wrapper now treats a captured compute container as a real desktop compute
+shader when a signed retarget is present in `X2W_SHADER_CACHE` (issue
+[#1412](https://github.com/R0Y00/Xbox2Windows/issues/1412), first slice). With
+`X2W_D3D12_RENDER=1` and `X2W_D3D12_LIST_NOOP=1`, device slot 62 hashes the captured container with
+FNV-1a 64 over `x2w-startup-compute-1` (graphics keys are unchanged), publishes
+`req_<key>.cs` plus a SHA-256 request manifest, and stays a placeholder until the offline pass
+validates, gates, signs and publishes `<key>.cs.cso` and a SHA-256 cache manifest. The runtime
+creates the PSO only from a manifest whose key, revision, source size, source SHA-256 and output
+SHA-256 agree. It supports root SRVs, root UAVs and root 32-bit constants; descriptor tables, root
+CBVs and unreadable or ambiguous addresses are refused with a logged reason. Dispatch uses list slot
+14 and a UAV barrier, with graphics and compute pipeline state kept apart. The PSO uses only the
+wrapped root signature the title supplied: a null, unwrapped or uninspectable root is refused, so no
+fallback root is derived from the container or cached under a title pointer. Every DWORD of a root
+32-bit constants parameter must be written before Dispatch; split and nonzero-offset writes
+accumulate, and only a root-signature change, Reset or Close drops them. A pipeline-class change
+leaves the arguments in place, as D3D12 does.
+
+When `--pso-probe` is supplied, the pending tool requires a `<backend>_root` result and, on a
+successful root, a `<backend>_pso` result for every backend the probe mode promises. A nonzero or
+missing root key, a missing PSO result after a successful root, a nonzero PSO HRESULT, an invalid
+HRESULT spelling or malformed JSON leaves `<key>.cs.error` and no cache entry. A container with no
+embedded `RTS0` part is an explicit `SKIPPED no embedded root signature` because the title supplies
+the root at Dispatch; that decision is made from the signed container, never from a failed root
+HRESULT. The cache manifest records `pso_probe PASSED`, `SKIPPED ...` or `NOT_RUN`; the runtime
+refuses a signed manifest that reports `FAILED`. A missing hardware adapter on a hardware-enabled
+probe is a retryable result with its own reason, not a success.
+
+The source-built fixture compiles `tests/startup_compute.hlsl`, wraps it as a synthetic
+`dxil-ms-xb2` container, processes the request with `tools/dxil_retarget.py --pending`, and reads
+back 64 words. On Windows 11 26300 with MSVC 19.44.35230.0, Windows SDK 10.0.26100.0 and validator
+`dxil.dll` 1.9.2602.17 (`module_only=validated`), the request key was `f6a3dd5ee2f5e824`, source
+SHA-256 `ef6ca73f2e17e6abe6cd198618e0dd2f3142ee2f74b653ab45edc955fe54b529`, and the signed
+container was 3520 bytes with SHA-256
+`84105f2719e7f11c3ae8fb8c1016eb111547cbf1f754ee745693298d0ffb141a`. The PSO probe reported
+`0x00000000` for the signed container and `0x80070057` for the unsigned and tampered ones, and the
+fixture's device slot 62 returned `0x00000000` for the real PSO. Normal execution recorded one
+dispatch and zero skipped; the repeated case recorded two and zero.
+
+Before the dispatch all 64 words were `deadbeef`. After one dispatch, WARP (Microsoft Basic Render
+Driver 10.0.26100.9818) and the Intel Iris Xe (31.0.101.5333) each produced the same 64 words, and
+the independent CPU reference in `tests/startup_compute_check.py` matched them exactly:
+
+```text
+deadbf7e deadc1e8 deadc31e deadc48c deadc6de deadc820 deadc97e deadcbcc deadcdbe deadce68
+deadd01e deadd2cc deadd47e deadd510 deadd7be deadd98c deadda1e deaddce8 deadde7e deaddf0c
+deade1be deade3a0 deade45e deade6cc deade89e deade968 deadebbe deaded8c deadee5e deadf030
+deadf2de deadf30c deadf53e deadf7e8 deadf81e deadfa4c deadfcde deadfd20 deadff3e deae018c
+deae01fe deae0468 deae069e deae070c deae093e deae0b90 deae0bfe deae0e4c deae109e deae12e8
+deae133e deae164c deae17fe deae17a0 deae195e deae1b0c deae1e9e deae2068 deae21fe deae21cc
+deae235e deae24f0 deae28de deae2a4c
+```
+
+The split 4+12 constant write and the reverse 4×4 nonzero-offset write each produced the same words
+as one 16-value write, and the second of two dependent dispatches read the first dispatch's result
+across a UAV barrier. Missing cache, explicit refusal, tampered output, a wrong signed shader under
+the same key, a descriptor-table root, an unwrapped desktop root (no fallback is created), a missing
+root signature, an unaligned UAV, one buffer bound as both root SRV and root UAV, a 34-parameter
+root (refused before and after a graphics/compute pipeline round trip, then a normal dispatch
+recovered and matched the reference), 12 of 16 constants, an invalid constant offset, an invalid
+constant range, a `0xFFFFFFFF` constant count (rejected before any source-memory scan), parameter
+index 32 on a 32-parameter root, a graphics pipeline bound for Dispatch, a signed manifest with
+`pso_probe FAILED` (refused by the runtime), and a third SRV upload past a test-lowered capacity of
+two each left the sentinel unchanged where applicable and recorded no unexpected dispatch. Parameter
+index 31 was accepted and only failed the root-signature comparison. Reset and a structurally
+different root signature each dropped the initialized-DWORD mask and refused the next Dispatch; the
+earlier output stayed exact. A draw through the compute pipeline was skipped while the compute
+output stayed exact; after Reset the stale second Dispatch was refused. The pending probe controls
+cover PASSED, an explicit stripped-root SKIPPED, NOT_RUN, failed root with a missing PSO result,
+successful root with a missing PSO result, failed PSO, missing root key, invalid HRESULT, malformed
+JSON, a contradictory root-failure-with-PSO result and a missing hardware adapter. With the Windows
+Graphics Tools capability installed, the D3D12 debug layer enabled on both adapters, the raw
+`x2w-d3d12 debug layer: 0x00000000 enabled` line was retained in the test log, and the fixture
+produced zero debug messages. Both `startup_compute_warp` and `startup_compute_hardware` pass. The
+final CTest run selected 30 tests: 29 passed, 0 failed and 1 capability skip
+(`startup_logical_view_warp`, where WARP accepts the 1,245,184-descriptor heap the fixture expects to
+exceed).
+
+```powershell
+cmake --preset dev
+cmake --build --preset dev
+ctest --preset dev --no-tests=error -R '^startup_compute_' -V
+ctest --preset dev --no-tests=error -R '^dxil_retarget_probe' -V
+```
+
+Stage 2H evidence is under `out/stage2h`; the Stage 2J rerun is under `out/stage2j`: `junit-final.xml`
+and `LastTest.final.log` for the 30-test run, separate JUnit/log pairs for the controls, probes,
+WARP, hardware, debug-layer runs, graphics regressions and compute-list fixtures, and
+`historical/` for the earlier failure records. The exact tested source snapshot (SHA-256, physical
+lines):
+
+```text
+d3d12_compute.inl            738  234aa6c4db42970c637dbb0b37fda1fbab71bbd1dae0eec1542f32e070f1d3e6
+compute_limits.h               8  eea6525e4a0d348ceda50328eb2cdc41ef04f3f77787d45188a75804a69dad4f
+d3d12_xs_device.cpp         3367  6c434be9a77e1c2e670ee4df97a5d4cbbe0991ebf46fb3895eb009dbb5965da3
+sha256.h                      91  b88a9d18a830312de5cdc8a4f7da549ab7257ff7819fb64cbcb523d44c6daad1
+startup_compute_consumer.cpp 482  6fb7bac2c34735bfac5fa4af8caf0b22416fac3760b77d2b388ea6578b0e4ca9
+startup_compute_check.py     368  ca69e2f5471a7ad51149dc1f0381b65ca2744bcd3a17e4656da6c452dbea50ec
+startup_compute.hlsl          19  a6790f3d0c58c50b1de0385a6f926b4a9e08fccd8640ad3313d3751bc795ba59
+dxil_retarget.py            1336  f21bc35776b7002456e88c5a95c76311d2139a4354c5f7e22c7f0750337158c9
+dxil_retarget_check.py      1171  27142b56e56123bddd5bfa9390cc6b74745814547fd981cd9704d7ba8d4c74f4
+```
+
+Not covered: Xbox intrinsic lowering, descriptor-table conversion, root CBVs, raw hardware
+descriptors, general title virtual-address translation, and compute results read by a draw in the
+same frame. The compute-root slot numbers are pinned only by this synthetic fixture, not by an
+observed title call site. Retained SRV uploads stop at 1024 entries (enforced atomically) and
+aliased buffers are held for the process lifetime, so a title that churns placed buffers would keep
+those references. A root SRV with no aliased placed buffer is uploaded through at most 64 KiB of
+readable title memory, which is the bound this slice documents rather than a size taken from the
+root signature. No fallback root signature is created; a root the shim did not create is refused,
+and two identical serialized root signatures may deduplicate to one desktop object, in which case
+rebinding them correctly keeps the existing arguments. The offline capture `PSO` chunk does not yet
+carry the pipeline class, the compute cache key or the compute root, so it cannot distinguish every
+slot-62 compute PSO from a graphics PSO; that is a deferred capture-format change.
+
+## Source-built native compute fixture: execution and readback
+
+A second, independent fixture translates two source-built gfx1013 compute programs to desktop DXIL
+and executes them through the startup wrapper. It starts from actual assembled machine code, not
+from a hand-written shader: `tests/compute_native_check.py` assembles the 1-D and 2-D programs with
+LLVM 15 `llvm-mc`, extracts `.text` with `llvm-objcopy`, decodes it with `pixel_aot.disassemble`,
+and lowers the result through the existing `compute_store_aot.lower()`. The revision-2 cache
+(`tools/startup/compute_native.py`) publishes two records with keys `d55528b6b2cfa1f8` (1-D,
+336-byte record, 124-byte native code) and `95c4c65e03a8b336` (2-D, 340-byte record, 128-byte
+native code). The fixed root is `SRV(t0), UAV(u0), 16 root constants at b0`, space 0, visibility
+ALL, root signature 1.1.
+
+The 156-check cache run passes in a fresh directory (`--out out/stage4f/fresh`) and reproduces the
+accepted keys, record SHA-256 values, HLSL identities and signed CSO sizes. The C++ consumer
+(`d3d12_compute_native.cpp`) independently applies the same acceptance decision and returns the
+exact verified CSO. A compile-time-guarded fixture hook in the existing `list_dispatch` enforces
+the approved key, real compute PSO, same device, matching root, all 16 constants, the record
+Dispatch dimensions, the guard bound, distinct aligned SRV/UAV buffers and the accessible extents
+(768 B 1-D source, 96 B 2-D source, 768 B destination) before any state transition or Dispatch.
+
+With `X2W_NATIVE_COMPUTE_FIXTURE=1`, `X2W_D3D12_PERMISSIVE=1`, `X2W_D3D12_RENDER=1`,
+`X2W_D3D12_LIST_NOOP=1` and the two approved keys, the fixture runs 16 desktop Dispatches per run:
+five single-dispatch positive cases and two Dispatches in the repeated case per profile, plus one
+alternative-source Dispatch per profile. It records 16 Dispatches and 34 Dispatch-time refusals;
+four further creation-time refusals (unapproved key, missing, corrupt and refused cache entries) do
+not increment the Dispatch-skip counter. Normal runs perform 74 internal checks per adapter and
+debug runs 78. WARP, Intel Iris Xe, and their debug-layer variants all compare all 320 output
+DWORDs against an independent CPU reference for full, partial, zero, cap-4000 and split-constant
+cases; the repeated case uses two destinations with caps 100000 and 4000 and both halves match.
+Inactive and tail words stay at the position-dependent sentinel. Zero-guard cases record a real
+desktop Dispatch and change no output word.
+
+Negative controls cover disabled activation, missing/invalid/refused/corrupt cache entries,
+placeholder/graphics pipelines, missing or incorrect roots, missing SRV/UAV, incomplete or invalid
+constants, an out-of-profile guard, wrong dimensions, undersized source/destination, an invalid
+binding offset, the same resource as SRV and UAV, stale arguments after Reset and a second-device
+list. A disabled readback export returns `E_ACCESSDENIED` before recording a transition or copy; the
+test proves a prior enabled copy is retained. Comparison sensitivity covers an omitted Dispatch, a
+wrong expected word, a different valid source, a wrong 2-D reference stride and a modified sentinel.
+The debug layer reports zero warnings, errors, corruption messages and device removals on both
+adapters. ### Protocol, activation and reproduction
+
+The authoritative adapter is `tools/startup/compute_native.py`; the cache revision is
+`x2w-startup-compute-native-2`, the manifest header `x2w-native-compute 2`, the record version 1 and
+the magic `X2WN`. The request/translation/compile/validation/signing/PSO-probe stages are the same
+split protocol as the slot 62 slice, with the accepted pins: translator
+`compute_store_aot/036cdd081f7f709a`, decoder `pixel_aot/607e451cbacf7ddf`, pipeline
+`4c343eb689c60174`, LLVM
+`de2e35a4f9b3f6a06d2a8a3342b3f62a3842b1923b8dfc2a6ce48e0cc2d1e85d`, compiler
+`495033935c058fc6d318ac257afdfa910795bf41b7e5ba905a0e7191dc8bd4fa`, validator
+`db108ffef7bcecb984bdccf2b4725719d65b2ce7f1ebc40019dbe6c5a7016e09`, target `dxil-ms-dx` and
+flags `cs_6_0 -E main`.
+
+The fixture is inert unless `X2W_NATIVE_COMPUTE_FIXTURE=1` and one of the two keys is used, on top
+of `X2W_D3D12_PERMISSIVE=1`, `X2W_D3D12_RENDER=1` and `X2W_D3D12_LIST_NOOP=1`; add
+`X2W_D3D12_DEBUG=1` for the debug-layer runs. Permissive mode only accepts and logs the Xbox
+parameter block and creates an ordinary desktop device at feature level 12.0; it does not parse a
+descriptor or weaken a check. Path identity `162` is internal to the fixture and is not an Xbox
+device slot.
+
+The fixed root is `SRV(t0), UAV(u0), 16 root constants at b0`, space 0, visibility ALL, root
+signature 1.1. The consumer extracts and verifies the RTS0 part with a bounded parser and passes the
+verified signed container to `CreateRootSignature` because this runtime extracts the embedded
+signature from the container and rejects the bare part. Root and PSO are created on one device.
+
+Toolchain: x64 Windows with Visual Studio 2022 C++ tools, the Windows SDK that supplies the pinned
+DXC, CMake/Ninja and Python 3.11+, plus WSL Ubuntu-22.04 with LLVM 15 (`llvm-mc`, `llvm-objcopy`,
+`libLLVM-15.so.1`). `root_probe` loads `dxcompiler.dll` and `dxil.dll` from the directory selected
+by `SDK_DXC_DIR` at configure time; use the same SDK for the cache.
+
+From the repository root:
+
+```powershell
+python -m venv out/pe-env
+.\out\pe-env\Scripts\python.exe -m pip install -r requirements-dev.txt
+cmake --preset dev
+cmake --build --preset dev --target root_probe root_device_probe startup_compute_native startup_compute_native_dispatch
+.\out\pe-env\Scripts\python.exe -B tests\compute_native_cache_check.py `
+    --out out\stage4f\fresh --wsl-distro Ubuntu-22.04 `
+    --dxc <SDK>\bin\10.0.26100.0\x64\dxc.exe `
+    --probe out\build\dev\root_probe.exe --pso-probe out\build\dev\root_device_probe.exe
+out\build\dev\startup_compute_native.exe controls out\stage4f\fresh\cache out\stage4b\cache
+out\build\dev\startup_compute_native_dispatch.exe warp     out\stage4f\fresh\cache
+out\build\dev\startup_compute_native_dispatch.exe hardware out\stage4f\fresh\cache
+out\build\dev\startup_compute_native_dispatch.exe warp     out\stage4f\fresh\cache debug
+out\build\dev\startup_compute_native_dispatch.exe hardware out\stage4f\fresh\cache debug
+```
+
+The cache is a machine-local, gitignored artifact; a contributor without it, or without a physical
+adapter for the `pso-hardware` evidence, gets a capability skip rather than a pass. The fixture does
+not support descriptor tables, root CBVs, more than 32 parameters or 64 constants, arbitrary native
+programs, COMPUTE_PGM_RSRC2 interpretation, Xbox intrinsic lowering, ExecuteIndirect, production
+slot 67 descriptor parsing or title virtual-address translation. A permanent refusal is
+revision-scoped; changing the translator or LLVM requires a cache revision bump or controlled
+refusal removal. Manifest digests and the non-zero DXBC digest are an integrity chain, not
+authentication. The repeated case proves two independent executions, not dependent same-UAV
+ordering. An ambiguous root SRV falls back to the documented bounded upload snapshot; an ambiguous
+root UAV is refused. Production slot 67 remains the placeholder and is not supported by this
+fixture.
+
+Measured native CTest selection: 8 invocations (4 N2 cache/PSO controls, 4 N3 execution modes), all
+passing; Python/C++ parity 92 rows with zero mismatches; frozen Stage 2J selection 30 tests, 29
+passed, 0 failed, 1 documented capability skip; graphics/shader regressions 8/8. The tested source
+hashes for the execution increment are:
+
+```text
+d3d12_compute_native.h            32508ecf816cbbe208751eebd689c19f07c0d8bfb927f800ade132200d74f0af
+d3d12_compute_native.cpp          601b4da17fc6552e7d8cb16f88b0d95146620688c878f368b0ce1507f2bb7f60
+d3d12_compute_native_bridge.inl   57580b034157fa84df0347dcbef1b8e86593c19690b9c6d4a5f6658b94b47e52
+d3d12_compute.inl                 bd0d5754b9c3aad79d3fcf24b5d7078b6cb4ecf28e24068fb0fa0d0693cdd8b3
+tests/startup_compute_native.cpp  ac95573677fd130a7a605eb714a83c0397535a1048aaaab42eced7666f689c7a
+tests/startup_compute_native_dispatch.cpp 4adb4618ebe7b40a34b9a16cd8add4e1b3ac2f940e699a105d6da6c70b2fc9f3
+```
+
+The cache is a machine-local, gitignored artifact; the tests skip with 77 when it is absent. The
+fixture is not production slot 67 ABI support: no title descriptor is parsed, slot 67 remains the
+placeholder, and ExecuteIndirect, Xbox intrinsic lowering and arbitrary native profiles are not
+implemented. The repeated case proves two independent executions, not dependent same-UAV ordering;
+the existing list path inserts a UAV barrier before each Dispatch. An ambiguous root SRV falls back
+to the documented bounded upload snapshot while an ambiguous root UAV is refused.

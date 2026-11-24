@@ -9,12 +9,16 @@
 // TABL (descriptor table binds), PRES (present). tools read it with out/gamerun/capture.py.
 
 struct Translation;
+enum class PipelineClass { unknown, graphics, compute };
 struct PipelineInfo {
     Translation* stream_translation = nullptr;
     bool has_stream_blend = false;
     D3D12_BLEND_DESC stream_blend{};
     int path = 0;                    // creating device slot: 57, 67, 55, 86, 62
     Wrapper* base = nullptr;         // slot 55: the pipeline it derives from
+    PipelineClass cls = PipelineClass::graphics;
+    u64 compute_key = 0;             // slot 62: the cache key of the signed container
+    ID3D12RootSignature* compute_root = nullptr;  // slot 62: the root signature the PSO was built with
     std::vector<unsigned char> desc;
     std::vector<unsigned char> state_a, state_b;  // slot 57: the two state blocks, copied at creation (the title frees them)
 };
@@ -88,10 +92,15 @@ bool title_backed(u64 title_handle, u64 bytes)
 }
 
 void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std::size_t bytes,
-                   Translation* translation = nullptr, const D3D12_BLEND_DESC* blend = nullptr)
+                   Translation* translation = nullptr, const D3D12_BLEND_DESC* blend = nullptr,
+                   PipelineClass cls = PipelineClass::graphics, u64 compute_key = 0,
+                   ID3D12RootSignature* compute_root = nullptr)
 {
     PipelineInfo info;
     info.stream_translation = translation;
+    info.cls = cls;
+    info.compute_key = compute_key;
+    info.compute_root = compute_root;
     if (blend) {
         info.stream_blend = *blend;
         info.has_stream_blend = true;

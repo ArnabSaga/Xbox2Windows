@@ -764,6 +764,214 @@ define void @main() {
     print("pure-python dxil_retarget controls: ok")
 
 
+def check_compute_pending_controls() -> None:
+    import tempfile
+
+    assert rt.compute_cache_key(b"") == 0x9B6778420362A97C
+    assert rt.compute_cache_key(b"abc") == 0xF5FFAC1F337A5574
+    assert rt.compute_cache_key(b"DXBC" + bytes(range(64))) == 0x9CD8B8D04BED76EF
+
+    bitcode = _encode_synthetic_bitcode(triple=rt.SOURCE_TRIPLE, abbreviated_triple=False,
+                                        abbreviated_md_name=False, include_xbox_md=True)
+    rts0 = struct.pack("<6I", 2, 0, 24, 0, 0, 0x03000000)
+    source = rt.build_dxbc_container([(b"RTS0", rts0), (b"DXIL", rt.pack_dxil_program((5 << 16) | 0x65, 0x105, bitcode))])
+
+    def request(directory: Path, data: bytes) -> str:
+        key = f"{rt.compute_cache_key(data):016x}"
+        (directory / f"req_{key}.cs").write_bytes(data)
+        (directory / f"{key}.cs.src").write_text(
+            f"x2w-compute-request 1\nkey {key}\nrevision {rt.COMPUTE_CACHE_REVISION}\n"
+            f"source_bytes {len(data)}\nsource_sha256 {hashlib.sha256(data).hexdigest()}\n", encoding="utf-8")
+        return key
+
+    def validation(status="0x00000000", calls=None):
+        return {
+            "container": {"status": status, "diagnostics": []},
+            "module": {"status": status, "diagnostics": []},
+            "ir": {"xbox_intrinsics": {"calls": calls or {}, "declarations": [], "metadata_only": [], "references": {}}},
+        }
+
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        key = request(directory, source)
+        signed = bytearray(source)
+        signed[4:20] = b"\x11" * 16
+        with patch("probe_roots.validate_shader", return_value=validation()), \
+             patch.object(rt, "sign_container", return_value=bytes(signed)) as signer:
+            assert rt.translate_compute_request(directory, key, Path("probe")) == "signed"
+            assert signer.call_count == 1
+        manifest = rt._read_manifest(directory / f"{key}.cs.manifest")
+        assert manifest["status"] == "signed" and manifest["key"] == key
+        assert manifest["output_sha256"] == hashlib.sha256(bytes(signed)).hexdigest()
+        assert (directory / f"{key}.cs.cso").read_bytes() == bytes(signed)
+        assert rt.translate_compute_request(directory, key, Path("probe")) == "cached"
+        # A zero-digest (unsigned) output is not a valid cache entry.
+        unsigned = bytearray(signed)
+        unsigned[4:20] = bytes(16)
+        (directory / f"{key}.cs.cso").write_bytes(bytes(unsigned))
+        assert not rt._valid_compute_cache(directory, key, source)
+        # A tampered output is not a valid cache entry.
+        (directory / f"{key}.cs.cso").write_bytes(b"DXBC" + bytes(60))
+        assert not rt._valid_compute_cache(directory, key, source)
+        # A manifest for another revision is stale: invalid, and reprocessed rather than trusted.
+        stale_text = (directory / f"{key}.cs.manifest").read_text(encoding="utf-8").replace(
+            f"revision {rt.COMPUTE_CACHE_REVISION}", "revision x2w-startup-compute-0")
+        (directory / f"{key}.cs.manifest").write_text(stale_text, encoding="utf-8")
+        assert not rt._valid_compute_cache(directory, key, source)
+        with patch("probe_roots.validate_shader", return_value=validation()), \
+             patch.object(rt, "sign_container", return_value=bytes(signed)):
+            assert rt.translate_compute_request(directory, key, Path("probe")) == "signed"
+
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        key = request(directory, source)
+        with patch("probe_roots.validate_shader", return_value=validation(calls={"xbox.BFI": 1})):
+            assert rt.translate_compute_request(directory, key, Path("probe")) == "refused: xbox intrinsic"
+        manifest = rt._read_manifest(directory / f"{key}.cs.manifest")
+        assert manifest["status"] == "refused" and "xbox" in manifest["reason"]
+        assert not (directory / f"{key}.cs.cso").exists()
+        # A refused manifest is authoritative even if a stale output exists.
+        (directory / f"{key}.cs.cso").write_bytes(b"DXBC" + bytes(60))
+        assert rt._valid_compute_cache(directory, key, source)
+        assert rt.translate_compute_request(directory, key, Path("probe")) == "cached"
+
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        key = request(directory, source)
+        with patch("probe_roots.validate_shader", return_value=validation(status="0x80aa0009")):
+            assert rt.translate_compute_request(directory, key, Path("probe")) == "refused: validation status"
+        assert rt._read_manifest(directory / f"{key}.cs.manifest")["status"] == "refused"
+
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        key = request(directory, source)
+        (directory / f"req_{key}.cs").write_bytes(source + b"x")
+        assert rt.translate_compute_request(directory, key, Path("probe")).startswith("retryable: request key mismatch")
+        assert (directory / f"{key}.cs.error").is_file()
+
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        key = request(directory, source)
+        failure = subprocess.CalledProcessError(1, ["probe", "--container"], stderr=b"dxil.dll not found")
+        with patch("probe_roots.validate_shader", side_effect=failure):
+            assert rt.translate_compute_request(directory, key, Path("probe")) == "retryable: validator unavailable"
+        assert (directory / f"{key}.cs.error").is_file()
+        assert not (directory / f"{key}.cs.manifest").exists()
+
+    print("compute pending controls: cross-language key, signed cso, refusal, stale revision, tamper and "
+          "retryable error paths ok")
+
+
+def check_compute_probe_controls() -> None:
+    """The pending PSO probe must return a complete PASSED, an explicit SKIPPED, or no cache entry."""
+    import tempfile
+
+    bitcode = _encode_synthetic_bitcode(triple=rt.SOURCE_TRIPLE, abbreviated_triple=False,
+                                        abbreviated_md_name=False, include_xbox_md=True)
+    program = rt.pack_dxil_program((5 << 16) | 0x65, 0x105, bitcode)
+    rts0 = struct.pack("<6I", 2, 0, 24, 0, 0, 0x03000000)
+    with_root = rt.build_dxbc_container([(b"RTS0", rts0), (b"DXIL", program)])
+    stripped = rt.build_dxbc_container([(b"DXIL", program)])
+
+    def run_case(source: bytes, *, probe_value=None, probe_error=None, warp_only: bool = False,
+                 request_probe: bool = True):
+        directory = Path(tempfile.mkdtemp())
+        key = f"{rt.compute_cache_key(source):016x}"
+        (directory / f"req_{key}.cs").write_bytes(source)
+        (directory / f"{key}.cs.src").write_text(
+            f"x2w-compute-request 1\nkey {key}\nrevision {rt.COMPUTE_CACHE_REVISION}\n"
+            f"source_bytes {len(source)}\nsource_sha256 {hashlib.sha256(source).hexdigest()}\n",
+            encoding="utf-8")
+        signed = bytearray(source)
+        signed[4:20] = b"\x11" * 16
+        validation = {
+            "container": {"status": "0x00000000", "diagnostics": []},
+            "module": {"status": "0x00000000", "diagnostics": []},
+            "ir": {"xbox_intrinsics": {"calls": {}, "declarations": [], "metadata_only": [], "references": {}}},
+        }
+        probe = patch.object(rt, "check_compute_pso", return_value=probe_value, side_effect=probe_error)
+        with patch("probe_roots.validate_shader", return_value=validation), \
+             patch.object(rt, "sign_container", return_value=bytes(signed)), probe as probe_mock:
+            outcome = rt.translate_compute_request(
+                directory, key, Path("probe"),
+                pso_probe=Path("dev") if request_probe else None, warp_only=warp_only)
+        manifest_path = directory / f"{key}.cs.manifest"
+        error_path = directory / f"{key}.cs.error"
+        manifest = rt._read_manifest(manifest_path) if manifest_path.is_file() else None
+        error = error_path.read_text(encoding="utf-8") if error_path.is_file() else None
+        calls = probe_mock.call_count
+        for path in directory.iterdir():
+            path.unlink()
+        directory.rmdir()
+        return outcome, manifest, error, calls
+
+    # Successful root and PSO creation, WARP-only mode (hardware keys are not expected).
+    outcome, manifest, error, calls = run_case(
+        with_root, probe_value={"warp_root": "0x00000000", "warp_pso": "0x00000000"}, warp_only=True)
+    assert outcome == "signed" and error is None, (outcome, error)
+    assert manifest["pso_probe"] == "PASSED", manifest
+    assert calls == 1, calls
+
+    # Hardware-enabled mode requires both backends.
+    outcome, manifest, _, _ = run_case(
+        with_root, probe_value={"warp_root": "0x00000000", "warp_pso": "0x00000000",
+                                "hardware_root": "0x00000000", "hardware_pso": "0x00000000"})
+    assert outcome == "signed" and manifest["pso_probe"] == "PASSED", (outcome, manifest)
+    outcome, _, error, _ = run_case(
+        with_root, probe_value={"warp_root": "0x00000000", "warp_pso": "0x00000000"})
+    assert outcome.startswith("retryable:") and "omitted hardware_root" in outcome, outcome
+    assert error is not None
+
+    # Failed root creation with the PSO key missing (the defect being fixed).
+    outcome, manifest, error, _ = run_case(with_root, probe_value={"warp_root": "0x80070057"}, warp_only=True)
+    assert outcome.startswith("retryable:") and "root signature creation failed 0x80070057" in outcome, outcome
+    assert manifest is None and error is not None
+    # Contradictory: root failed but a PSO value is present; the root result is authoritative.
+    outcome, _, _, _ = run_case(
+        with_root, probe_value={"warp_root": "0x80070057", "warp_pso": "0x00000000"}, warp_only=True)
+    assert "root signature creation failed" in outcome, outcome
+
+    # Successful root with the PSO result missing.
+    outcome, _, _, _ = run_case(with_root, probe_value={"warp_root": "0x00000000"}, warp_only=True)
+    assert "omitted warp_pso" in outcome, outcome
+    # Failed PSO HRESULT.
+    outcome, _, _, _ = run_case(
+        with_root, probe_value={"warp_root": "0x00000000", "warp_pso": "0x80070057"}, warp_only=True)
+    assert "compute PSO creation failed 0x80070057" in outcome, outcome
+    # Missing root-result key.
+    outcome, _, _, _ = run_case(with_root, probe_value={"warp_pso": "0x00000000"}, warp_only=True)
+    assert "omitted warp_root" in outcome, outcome
+    # Invalid HRESULT spelling.
+    outcome, _, _, _ = run_case(
+        with_root, probe_value={"warp_root": "banana", "warp_pso": "0x00000000"}, warp_only=True)
+    assert "invalid HRESULT representation" in outcome, outcome
+    # Malformed probe JSON (json.JSONDecodeError is a ValueError).
+    outcome, _, _, _ = run_case(
+        with_root, probe_error=json.JSONDecodeError("Expecting value", "", 0), warp_only=True)
+    assert outcome.startswith("retryable: PSO probe FAILED"), outcome
+
+    # No embedded root signature: an explicit skip, not a root failure and not a probe call.
+    outcome, manifest, error, calls = run_case(stripped, request_probe=True)
+    assert outcome == "signed" and error is None, (outcome, error)
+    assert manifest["pso_probe"].startswith("SKIPPED no embedded root signature"), manifest
+    assert calls == 0, calls
+
+    # Explicit adapter capability limitation: retryable, no cache entry, distinct reason.
+    outcome, manifest, error, _ = run_case(
+        with_root, probe_error=subprocess.CalledProcessError(5, ["dev"], stderr=b"No compatible hardware adapter.\n"),
+        warp_only=False)
+    assert outcome == "retryable: PSO probe unavailable: no hardware adapter", outcome
+    assert manifest is None and error is not None
+
+    # Probe not requested: signed with an explicit NOT_RUN status.
+    outcome, manifest, _, calls = run_case(with_root, request_probe=False)
+    assert outcome == "signed" and manifest["pso_probe"] == "NOT_RUN", (outcome, manifest)
+    assert calls == 0, calls
+
+    print("compute probe controls: PASSED, SKIPPED, NOT_RUN, missing/invalid/failed root and PSO results, "
+          "malformed JSON and adapter limitation ok")
+
+
 def _probe_compute_pso(device_probe: Path, blob: bytes, *, backend: str,
                        intrinsics: dict | None = None) -> dict | None:
     """Run root_device_probe --compute-pso; return None on hardware backend exit 5 (no GPU)."""
@@ -944,6 +1152,8 @@ def check_validator_fixtures(
 
 def main() -> int:
     check_pure_python_controls()
+    check_compute_pending_controls()
+    check_compute_probe_controls()
     if len(sys.argv) == 1:
         return 0
     if len(sys.argv) not in (5, 7, 8):

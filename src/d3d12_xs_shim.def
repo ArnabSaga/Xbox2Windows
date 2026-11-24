@@ -4,6 +4,19 @@ EXPORTS
     D3D12CreateRootSignatureDeserializer=d3d12_xs_CreateRootSignatureDeserializer
     D3D12XboxCreateDevice=d3d12_xs_XboxCreateDevice
     D3D12ConfigureVirtualMemoryX=d3d12_xs_ConfigureVirtualMemoryX
+    x2w_d3d12_compute_cache_key
+    x2w_d3d12_compute_dispatches
+    x2w_d3d12_compute_skipped_dispatches
+    x2w_d3d12_pipeline_real
+    x2w_native_fixture_create
+    x2w_native_fixture_release
+    x2w_native_fixture_release_root
+    x2w_native_fixture_info
+    x2w_native_fixture_root
+    x2w_native_fixture_readback
+    x2w_native_fixture_extent_ok
+    x2w_native_fixture_render_mode
+    x2w_native_fixture_list_reason
     IID_ID3D12CommandAllocator DATA
     IID_ID3D12CommandList DATA
     IID_ID3D12CommandQueue DATA

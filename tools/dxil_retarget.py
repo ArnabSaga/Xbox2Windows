@@ -18,6 +18,28 @@ DESKTOP_TRIPLE = "dxil-ms-dx"
 DEFAULT_DROP_METADATA = ("xbox.compiler.options",)
 XBOX_ROOT_SIGNATURE_FLAGS = 0x03000000
 
+COMPUTE_CACHE_REVISION = "x2w-startup-compute-1"
+FNV_OFFSET = 1469598103934665603
+FNV_PRIME = 1099511628211
+
+
+class InfrastructureError(RuntimeError):
+    """A retryable problem: missing probe, unreadable output, or a probe process failure."""
+
+
+class ProbeError(RuntimeError):
+    """A PSO-probe result that cannot support a signed cache entry."""
+
+
+def fnv_bytes(data: bytes, current: int = FNV_OFFSET) -> int:
+    for byte in data:
+        current = ((current ^ byte) * FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
+    return current
+
+
+def compute_cache_key(data: bytes) -> int:
+    return fnv_bytes(data, fnv_bytes(COMPUTE_CACHE_REVISION.encode("ascii")))
+
 BLOCKINFO_BLOCK_ID = 0
 MODULE_BLOCK_ID = 8
 METADATA_BLOCK_ID = 15
@@ -670,6 +692,312 @@ def export_compute_catalogue_entry(directory: Path, original: bytes, desktop: by
     return destination
 
 
+def _read_manifest(path: Path) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not lines or lines[0] not in ("x2w-compute-request 1", "x2w-compute-cache 1"):
+        raise ValueError("unexpected compute manifest header")
+    for line in lines[1:]:
+        if not line:
+            continue
+        name, _, value = line.partition(" ")
+        if not name:
+            raise ValueError(f"malformed compute manifest field {line!r}")
+        fields[name] = value
+    return fields
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        handle.write(data)
+    try:
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _manifest_text(fields: list[tuple[str, str]]) -> bytes:
+    return "".join(f"{name} {value}\n" for name, value in fields).encode("utf-8")
+
+
+def _remove(path: Path) -> None:
+    path.unlink(missing_ok=True)
+
+
+def _probe_hresult(value: object, label: str) -> str:
+    """Validate the probe's 0x%08lx spelling before comparing it."""
+    if (not isinstance(value, str) or len(value) != 10 or not value.startswith("0x") or
+            any(character not in "0123456789abcdefABCDEF" for character in value[2:])):
+        raise ProbeError(f"{label} has an invalid HRESULT representation {value!r}")
+    return value.lower()
+
+
+def _has_embedded_root(container: bytes) -> bool:
+    """A stripped-root container is skipped only when the container itself proves it has no RTS0."""
+    try:
+        return b"RTS0" in parts(container)
+    except (ValueError, struct.error) as error:
+        raise ProbeError(f"signed container is malformed: {error}") from error
+
+
+def _validate_probe_result(pso: object, *, warp_only: bool) -> str:
+    """Require every backend the probe mode promises, with a root result and (on success) a PSO result."""
+    if not isinstance(pso, dict):
+        raise ProbeError("result is not a JSON object")
+    for name in ["warp"] + ([] if warp_only else ["hardware"]):
+        root_key = f"{name}_root"
+        if root_key not in pso:
+            raise ProbeError(f"result omitted {root_key}")
+        root = _probe_hresult(pso[root_key], root_key)
+        if root != "0x00000000":
+            raise ProbeError(f"{name} root signature creation failed {root}")
+        pso_key = f"{name}_pso"
+        if pso_key not in pso:
+            raise ProbeError(f"result omitted {pso_key} after successful root creation")
+        result = _probe_hresult(pso[pso_key], pso_key)
+        if result != "0x00000000":
+            raise ProbeError(f"{name} compute PSO creation failed {result}")
+    return "PASSED"
+
+
+def _publish_compute_refused(directory: Path, key: str, source: bytes, reason: str) -> None:
+    source_sha = hashlib.sha256(source).hexdigest()
+    _remove(directory / f"{key}.cs.cso")
+    _remove(directory / f"{key}.cs.error")
+    _remove(directory / f"{key}.cs.manifest")
+    manifest = _manifest_text([
+        ("x2w-compute-cache", "1"),
+        ("key", key),
+        ("revision", COMPUTE_CACHE_REVISION),
+        ("status", "refused"),
+        ("source_bytes", str(len(source))),
+        ("source_sha256", source_sha),
+        ("reason", " ".join(reason.split())),
+    ])
+    _write_atomic(directory / f"{key}.cs.manifest", manifest)
+
+
+def _publish_compute_signed(directory: Path, key: str, source: bytes, signed: bytes,
+                            pso_probe: str = "NOT_RUN") -> None:
+    source_sha = hashlib.sha256(source).hexdigest()
+    output_sha = hashlib.sha256(signed).hexdigest()
+    _remove(directory / f"{key}.cs.error")
+    _remove(directory / f"{key}.cs.manifest")
+    _write_atomic(directory / f"{key}.cs.cso", signed)
+    manifest = _manifest_text([
+        ("x2w-compute-cache", "1"),
+        ("key", key),
+        ("revision", COMPUTE_CACHE_REVISION),
+        ("status", "signed"),
+        ("pso_probe", pso_probe),
+        ("source_bytes", str(len(source))),
+        ("source_sha256", source_sha),
+        ("output_bytes", str(len(signed))),
+        ("output_sha256", output_sha),
+    ])
+    _write_atomic(directory / f"{key}.cs.manifest", manifest)
+
+
+def _publish_compute_error(directory: Path, key: str, reason: str) -> None:
+    _remove(directory / f"{key}.cs.cso")
+    _remove(directory / f"{key}.cs.manifest")
+    _write_atomic(directory / f"{key}.cs.error", (" ".join(reason.split()) + "\n").encode("utf-8"))
+
+
+def _valid_compute_cache(directory: Path, key: str, source: bytes) -> bool:
+    manifest_path = directory / f"{key}.cs.manifest"
+    if not manifest_path.is_file():
+        return False
+    try:
+        fields = _read_manifest(manifest_path)
+    except (OSError, ValueError):
+        return False
+    source_sha = hashlib.sha256(source).hexdigest()
+    if (fields.get("key") != key or fields.get("revision") != COMPUTE_CACHE_REVISION or
+            fields.get("source_bytes") != str(len(source)) or fields.get("source_sha256") != source_sha):
+        return False
+    status = fields.get("status")
+    if status == "refused":
+        return True
+    if status != "signed":
+        return False
+    probe = fields.get("pso_probe")
+    if probe is not None and probe.partition(" ")[0] == "FAILED":
+        return False
+    output = directory / f"{key}.cs.cso"
+    if not output.is_file():
+        return False
+    signed = output.read_bytes()
+    return (len(signed) >= 32 and fields.get("output_bytes") == str(len(signed)) and
+            fields.get("output_sha256") == hashlib.sha256(signed).hexdigest() and
+            signed[:4] == b"DXBC" and signed[4:20] != bytes(16))
+
+
+def translate_compute_request(directory: Path, key: str, probe: Path, *,
+                              pso_probe: Path | None = None, warp_only: bool = False) -> str:
+    """Process one runtime request. Returns a short outcome for the pending summary."""
+    request = directory / f"req_{key}.cs"
+    request_manifest = directory / f"{key}.cs.src"
+    try:
+        source = request.read_bytes()
+    except OSError as error:
+        _publish_compute_error(directory, key, f"cannot read the request: {error}")
+        return "retryable: request unreadable"
+    if compute_cache_key(source) != int(key, 16):
+        _publish_compute_error(directory, key, "request filename does not match its container bytes")
+        return "retryable: request key mismatch"
+    try:
+        fields = _read_manifest(request_manifest)
+    except (OSError, ValueError) as error:
+        _publish_compute_error(directory, key, f"request manifest invalid: {error}")
+        return "retryable: request manifest invalid"
+    source_sha = hashlib.sha256(source).hexdigest()
+    if (fields.get("key") != key or fields.get("revision") != COMPUTE_CACHE_REVISION or
+            fields.get("source_bytes") != str(len(source)) or fields.get("source_sha256") != source_sha):
+        _publish_compute_error(directory, key, "request manifest does not match the container")
+        return "retryable: request manifest mismatch"
+    if _valid_compute_cache(directory, key, source):
+        return "cached"
+
+    if source[:4] != b"DXBC":
+        _publish_compute_refused(directory, key, source, "request is not a DXBC container")
+        return "refused: not DXBC"
+    try:
+        source_parts = parts(source)
+    except (ValueError, struct.error) as error:
+        _publish_compute_refused(directory, key, source, f"malformed DXBC container: {error}")
+        return "refused: malformed container"
+    if b"DXIL" not in source_parts:
+        _publish_compute_refused(directory, key, source, "request has no DXIL part")
+        return "refused: no DXIL"
+    try:
+        retargeted, _ = retarget_container(source)
+    except (ValueError, KeyError, IndexError, struct.error) as error:
+        _publish_compute_refused(directory, key, source, f"retarget failed: {error}")
+        return "refused: retarget failed"
+    try:
+        from probe_roots import validate_shader
+
+        sections = parts(retargeted)
+        after = validate_shader(probe, retargeted, sections[b"DXIL"], optional_modes=("module",))
+    except FileNotFoundError as error:
+        _publish_compute_error(directory, key, f"probe missing: {error}")
+        return "retryable: probe missing"
+    except subprocess.TimeoutExpired as error:
+        _publish_compute_error(directory, key, f"probe timed out: {error}")
+        return "retryable: probe timeout"
+    except subprocess.CalledProcessError as error:
+        diagnostic = (error.stderr or b"").decode("utf-8", "replace").strip()
+        if "dxil.dll" in diagnostic.lower() or "loadlibrary" in diagnostic.lower():
+            _publish_compute_error(directory, key, f"validator unavailable: {diagnostic}")
+            return "retryable: validator unavailable"
+        _publish_compute_refused(directory, key, source, f"validation refused: {diagnostic or error.returncode}")
+        return "refused: validation failed"
+    except (OSError, ValueError) as error:
+        _publish_compute_refused(directory, key, source, f"validation failed: {error}")
+        return "refused: validation failed"
+
+    container = after["container"]
+    module = after["module"]
+    if container.get("status") != "0x00000000" or module.get("status") != "0x00000000":
+        diagnostic = container.get("diagnostics") or module.get("diagnostics") or []
+        _publish_compute_refused(directory, key, source,
+                                 f"validation status {container.get('status')}/{module.get('status')}: "
+                                 f"{' | '.join(diagnostic)}")
+        return "refused: validation status"
+
+    from xbox_intrinsic_gate import ALLOW, decide
+
+    decision = decide(after["ir"]["xbox_intrinsics"])
+    if decision["verdict"] != ALLOW:
+        _publish_compute_refused(directory, key, source, decision["message"])
+        return "refused: xbox intrinsic"
+
+    try:
+        signed = sign_container(probe, retargeted)
+    except FileNotFoundError as error:
+        _publish_compute_error(directory, key, f"signer missing: {error}")
+        return "retryable: signer missing"
+    except OSError as error:
+        _publish_compute_error(directory, key, f"signer failed: {error}")
+        return "retryable: signer failed"
+    except RuntimeError as error:
+        if "dxil.dll" in str(error).lower() or "loadlibrary" in str(error).lower():
+            _publish_compute_error(directory, key, f"signer unavailable: {error}")
+            return "retryable: signer unavailable"
+        _publish_compute_refused(directory, key, source, f"signing refused: {error}")
+        return "refused: signing refused"
+
+    probe_status = "NOT_RUN"
+    if pso_probe is not None:
+        try:
+            has_root = _has_embedded_root(signed)
+        except ProbeError as error:
+            _publish_compute_error(directory, key, str(error))
+            return f"retryable: {error}"
+        if not has_root:
+            # Independently confirmed from the signed container: the title supplies the root
+            # signature at Dispatch, so the probe has nothing to create. This is not inferred
+            # from a failed root HRESULT.
+            probe_status = "SKIPPED no embedded root signature"
+        else:
+            try:
+                pso = check_compute_pso(pso_probe, signed, warp_only=warp_only,
+                                        intrinsics=after["ir"]["xbox_intrinsics"])
+            except subprocess.CalledProcessError as error:
+                if error.returncode == 5:
+                    _publish_compute_error(directory, key,
+                                           "PSO probe unavailable: no hardware adapter; rerun with --warp-only")
+                    return "retryable: PSO probe unavailable: no hardware adapter"
+                _publish_compute_error(directory, key, f"PSO probe failed: exit {error.returncode}")
+                return "retryable: PSO probe failed"
+            except (OSError, subprocess.TimeoutExpired) as error:
+                _publish_compute_error(directory, key, f"PSO probe failed: {error}")
+                return "retryable: PSO probe failed"
+            except (ValueError, KeyError) as error:
+                _publish_compute_error(directory, key, f"PSO probe FAILED: {error}")
+                return f"retryable: PSO probe FAILED: {error}"
+            try:
+                probe_status = _validate_probe_result(pso, warp_only=warp_only)
+            except ProbeError as error:
+                _publish_compute_error(directory, key, f"PSO probe FAILED: {error}")
+                return f"retryable: PSO probe FAILED: {error}"
+
+    _publish_compute_signed(directory, key, source, signed, probe_status)
+    if pso_probe is not None:
+        print(f"{key}: pso probe {probe_status}")
+    return "signed"
+
+
+def process_compute_requests(directory: Path, probe: Path, *, pso_probe: Path | None = None,
+                             warp_only: bool = False) -> int:
+    outcomes = {"signed": 0, "refused": 0, "cached": 0, "retryable": 0}
+    errors = 0
+    for request in sorted(directory.glob("req_*.cs")):
+        key = request.name[4:-3]
+        if len(key) != 16 or any(character not in "0123456789abcdef" for character in key):
+            print(f"{request.name}: ignored (not a 16-hex request key)", file=sys.stderr)
+            continue
+        if not (directory / f"{key}.cs.src").is_file():
+            print(f"{key}: ignored (request manifest not published yet)", file=sys.stderr)
+            continue
+        outcome = translate_compute_request(directory, key, probe, pso_probe=pso_probe, warp_only=warp_only)
+        print(f"{key}: {outcome}")
+        if outcome == "signed":
+            outcomes["signed"] += 1
+        elif outcome == "cached":
+            outcomes["cached"] += 1
+        elif outcome.startswith("refused"):
+            outcomes["refused"] += 1
+        else:
+            outcomes["retryable"] += 1
+            errors += 1
+    print(json.dumps({"pending": outcomes}, sort_keys=True))
+    return 1 if errors else 0
+
+
 def validate_pe_containers(
     pe_path: Path,
     probe: Path,
@@ -814,6 +1142,8 @@ def main() -> int:
     parser.add_argument("input", nargs="?", type=Path, help="Input DXBC container or raw DXIL bitcode file")
     parser.add_argument("output", nargs="?", type=Path, help="Output file path")
     parser.add_argument("--pe", type=Path, help="Extract, retarget, and validate containers embedded in a PE image")
+    parser.add_argument("--pending", type=Path,
+                        help="Process runtime compute requests req_<key>.cs in this cache directory")
     parser.add_argument("--output-dir", type=Path, help="Optional directory to write retargeted containers in --pe mode")
     parser.add_argument("--catalogue-dir", type=Path,
                         help="Export signed, validated desktop compute containers by input SHA-256 in --pe mode")
@@ -839,6 +1169,24 @@ def main() -> int:
     parser.add_argument("--warp-only", action="store_true",
                         help="Use only the WARP adapter with --pso-probe")
     args = parser.parse_args()
+
+    if args.pending:
+        if args.input or args.output or args.pe:
+            parser.error("--pending cannot be combined with input/output or --pe")
+        if not args.probe:
+            parser.error("--pending requires --probe")
+        if args.warp_only and not args.pso_probe:
+            parser.error("--warp-only requires --pso-probe")
+        for dead in ("--output-dir", "--catalogue-dir", "--report", "--only-without-xbox-calls",
+                     "--extract-module", "--keep-root-flags"):
+            if getattr(args, dead[2:].replace("-", "_")):
+                parser.error(f"{dead} does not apply to --pending")
+        return process_compute_requests(
+            args.pending.resolve(),
+            args.probe.resolve(strict=True),
+            pso_probe=args.pso_probe.resolve(strict=True) if args.pso_probe else None,
+            warp_only=args.warp_only,
+        )
 
     if not args.pe:
         for dead in ("--output-dir", "--catalogue-dir", "--report", "--only-without-xbox-calls"):

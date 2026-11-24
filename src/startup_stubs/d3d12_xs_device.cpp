@@ -41,16 +41,22 @@
 #include <algorithm>
 #include <array>
 #include <cstdarg>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include "startup_stubs/sha256.h"
+#include "startup_stubs/compute_limits.h"
 
 namespace {
 
@@ -976,6 +982,9 @@ HRESULT __stdcall device_residency(Wrapper* self, UINT count, void* const* objec
 // Everything else on a list is still dropped.
 void release_targets(Wrapper* self);
 void discard_draw_sampler_heaps(Wrapper* self);
+struct Pass;
+Pass& pass_of(Wrapper* self);
+void clear_compute_bindings(Pass& pass);
 void use_as_target(Wrapper* self, ID3D12Resource* resource);
 bool is_container(const void* p);
 bool shader_dump_dir(wchar_t* out, DWORD size);
@@ -1190,6 +1199,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
     }
     if (SUCCEEDED(hr)) {
         self->own().list_ready = false;
+        clear_compute_bindings(pass_of(self));
         discard_draw_sampler_heaps(self);
         if (draw_dump_frame()) draw_dumps().discard(static_cast<ID3D12CommandList*>(self->own().real));
     }
@@ -1400,6 +1410,8 @@ std::size_t readable_window(u64 address, std::size_t wanted);
 struct RootParameter {
     D3D12_ROOT_PARAMETER_TYPE type;
     UINT shader_register, space;
+    UINT constant_count = 0;     // 32-bit constants declared by a ROOT_CONSTANTS parameter
+    bool descriptor_table = false;
 };
 SRWLOCK root_lock = SRWLOCK_INIT;
 std::unordered_map<const Wrapper*, std::vector<RootParameter>>& root_infos()
@@ -1414,6 +1426,38 @@ const std::vector<RootParameter>* root_info(const Wrapper* root)
     const std::vector<RootParameter>* info = found == root_infos().end() ? nullptr : &found->second;
     ReleaseSRWLockShared(&root_lock);
     return info;
+}
+
+// Reads the parameter list from a serialized root signature, including the declared constant count
+// and whether a descriptor table is present. Used by graphics and by the compute fallback path.
+bool read_root_parameters(const void* blob, SIZE_T size, std::vector<RootParameter>& parameters)
+{
+    parameters.clear();
+    ID3D12VersionedRootSignatureDeserializer* deserializer = nullptr;
+    if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&deserializer)))) return false;
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc = nullptr;
+    bool ok = SUCCEEDED(deserializer->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &desc)) && desc;
+    if (ok) {
+        for (UINT i = 0; i < desc->Desc_1_1.NumParameters; ++i) {
+            const auto& parameter = desc->Desc_1_1.pParameters[i];
+            RootParameter info{parameter.ParameterType, 0, 0};
+            if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV ||
+                parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV ||
+                parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV) {
+                info.shader_register = parameter.Descriptor.ShaderRegister;
+                info.space = parameter.Descriptor.RegisterSpace;
+            } else if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+                info.shader_register = parameter.Constants.ShaderRegister;
+                info.space = parameter.Constants.RegisterSpace;
+                info.constant_count = parameter.Constants.Num32BitValues;
+            } else if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+                info.descriptor_table = true;
+            }
+            parameters.push_back(info);
+        }
+    }
+    deserializer->Release();
+    return ok;
 }
 
 // Device slot 16, desktop CreateRootSignature(node, blob, size, riid, ppv); the parameter list is
@@ -1434,35 +1478,24 @@ HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const v
     Wrapper* w = wrap(root, root_signature_kind);
     note_root_blob(w, blob, size);
     std::vector<RootParameter> parameters;
-    ID3D12VersionedRootSignatureDeserializer* deserializer = nullptr;
-    if (SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&deserializer)))) {
-        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc = nullptr;
-        if (SUCCEEDED(deserializer->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &desc)) && desc) {
-            for (UINT i = 0; i < desc->Desc_1_1.NumParameters; ++i) {
-                const auto& parameter = desc->Desc_1_1.pParameters[i];
-                RootParameter info{parameter.ParameterType, 0, 0};
-                if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV || parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV ||
-                    parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV) {
-                    info.shader_register = parameter.Descriptor.ShaderRegister;
-                    info.space = parameter.Descriptor.RegisterSpace;
-                }
-                parameters.push_back(info);
-            }
-        }
-        deserializer->Release();
-    }
+    const bool parsed = read_root_parameters(blob, size, parameters);
     if (log_it) {
         char text[256] = "";
         int used = 0;
         for (std::size_t i = 0; i < parameters.size() && used < 220; ++i)
-            used += std::snprintf(text + used, sizeof(text) - used, " %d:r%u,s%u", parameters[i].type, parameters[i].shader_register,
-                                  parameters[i].space);
+            used += std::snprintf(text + used, sizeof(text) - used, " %d:r%u,s%u%s", parameters[i].type,
+                                  parameters[i].shader_register, parameters[i].space,
+                                  parameters[i].descriptor_table ? ":table" : "");
         log("x2w-d3d12 Device::CreateRootSignature size=0x%llx -> %p parameters (type:register,space)%s", static_cast<u64>(size),
             static_cast<void*>(w), text);
     }
-    AcquireSRWLockExclusive(&root_lock);
-    root_infos()[w] = std::move(parameters);
-    ReleaseSRWLockExclusive(&root_lock);
+    // Only a parsed list is recorded, so a root whose parameters could not be inspected stays
+    // distinguishable from a legitimately parameterless one (compute_parameters_for returns false).
+    if (parsed) {
+        AcquireSRWLockExclusive(&root_lock);
+        root_infos()[w] = std::move(parameters);
+        ReleaseSRWLockExclusive(&root_lock);
+    }
     *out = w;
     return S_OK;
 }
@@ -1616,6 +1649,7 @@ std::size_t readable_window(u64 address, std::size_t wanted)
 // Per-list state while recording.
 struct Pass {
     bool pipeline_real = false;      // the bound pipeline has a desktop pipeline
+    PipelineClass pipeline_class = PipelineClass::unknown;
     bool targets_bound = false;
     bool topology_ok = false;
     unsigned srv_bound = 0;          // bit per root parameter with a desktop address bound
@@ -1639,6 +1673,20 @@ struct Pass {
     std::unique_ptr<x2w_startup::SamplerSnapshot> sampler_snapshot;
     x2w_startup::ComPtr<ID3D12DescriptorHeap> sampler_heap;
     ID3D12DescriptorHeap* bound_sampler_heap = nullptr;
+    // Compute state is separate from the graphics state above. Root constants are kept per
+    // parameter because D3D12 only replaces the range a call names.
+    std::vector<RootParameter> compute_root_params;
+    ID3D12RootSignature* compute_root_real = nullptr;
+    ID3D12RootSignature* compute_required_root = nullptr;
+    bool compute_root_unsupported = false;  // survives argument clears; Dispatch refuses on it
+    std::uint32_t compute_constants[x2w_compute::max_root_parameters][x2w_compute::max_root_constants] = {};
+    std::uint64_t compute_constants_set[x2w_compute::max_root_parameters] = {};  // bit per DWORD
+    bool compute_srv_set[x2w_compute::max_root_parameters] = {};
+    u64 compute_srv_address[x2w_compute::max_root_parameters] = {};
+    bool compute_uav_set[x2w_compute::max_root_parameters] = {};
+    u64 compute_uav_address[x2w_compute::max_root_parameters] = {};
+    bool compute_bind_error = false;
+    char compute_bind_reason[160] = {};
 };
 LONG render_draws, render_draws_skipped, render_pipelines_real, render_pipelines_missing;
 
@@ -1673,6 +1721,28 @@ void release_targets(Wrapper* self)
     pass = Pass{};
 }
 
+// Clears the compute arguments for the current root signature. Only a root-signature change, a
+// Reset, or a Close invalidates them; a pipeline-class change leaves D3D12's root arguments alone.
+void clear_compute_arguments(Pass& pass)
+{
+    std::memset(pass.compute_constants, 0, sizeof(pass.compute_constants));
+    std::memset(pass.compute_constants_set, 0, sizeof(pass.compute_constants_set));
+    std::memset(pass.compute_srv_set, 0, sizeof(pass.compute_srv_set));
+    std::memset(pass.compute_srv_address, 0, sizeof(pass.compute_srv_address));
+    std::memset(pass.compute_uav_set, 0, sizeof(pass.compute_uav_set));
+    std::memset(pass.compute_uav_address, 0, sizeof(pass.compute_uav_address));
+    pass.compute_bind_error = false;
+    pass.compute_bind_reason[0] = 0;
+}
+void clear_compute_bindings(Pass& pass)
+{
+    clear_compute_arguments(pass);
+    pass.compute_root_real = nullptr;
+    pass.compute_root_params.clear();
+    pass.compute_required_root = nullptr;
+    pass.compute_root_unsupported = false;
+}
+
 // List slot 20, IASetPrimitiveTopology. 0x11 is a console-only rectangle list (no desktop draw yet).
 void __stdcall list_topology(Wrapper* self, UINT topology)
 {
@@ -1685,8 +1755,15 @@ void __stdcall list_pipeline(Wrapper* self, void* pipeline)
 {
     Wrapper* w = as_wrapper(pipeline);
     Pass& pass = pass_of(self);
+    const PipelineInfo* info = w && w->own().kind == pipeline_kind ? pipeline_info(w) : nullptr;
+    const PipelineClass cls = info ? info->cls : (w && w->own().kind == pipeline_kind && w->own().real
+                                                       ? PipelineClass::graphics : PipelineClass::unknown);
+    // D3D12 keeps root arguments across SetPipelineState, so only the class changes here. The
+    // sticky unsupported-root status still stops a compute Dispatch after a graphics round trip.
+    pass.pipeline_class = cls;
     pass.pipeline_real = w && w->own().kind == pipeline_kind && w->own().real;
     pass.pipeline = w && w->own().kind == pipeline_kind ? w : nullptr;
+    pass.compute_required_root = cls == PipelineClass::compute && info ? info->compute_root : nullptr;
     InterlockedIncrement(pass.pipeline_real ? &render_pipelines_real : &render_pipelines_missing);
     if (auto* list = recording(self); list && pass.pipeline_real) list->SetPipelineState(static_cast<ID3D12PipelineState*>(w->own().real));
 }
@@ -1771,6 +1848,13 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
+    if (pass.pipeline_class == PipelineClass::compute) {
+        static LONG compute_draws;
+        if (first_calls(compute_draws, 4)) log("x2w-render DrawInstanced(%u, %u, %u, %u) skipped: a compute pipeline is bound",
+                                              vertices, instances, first_vertex, first_instance);
+        InterlockedIncrement(&render_draws_skipped);
+        return;
+    }
     if (list && !pass.pipeline_real) {
         InterlockedIncrement(draw_translated(self, false, vertices, instances, first_vertex, 0, first_instance) ? &translated_draws
                                                                                                                 : &untranslated_draws);
@@ -1794,6 +1878,7 @@ struct TextureWrite {
 std::unordered_map<u64, TextureWrite>& written_textures();
 ID3D12Resource* sampled_address_texture(Wrapper* resource);
 #include "startup_stubs/d3d12_draw.inl"
+#include "startup_stubs/d3d12_compute.inl"
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
 void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
@@ -2620,10 +2705,11 @@ void dump_containers(const char* what, const void* desc, std::size_t bytes)
 HRESULT __stdcall placeholder_ok(Wrapper*, u64, u64, u64) { return S_OK; }
 
 // Device slot 62 (Xbox order): (D3D12_COMPUTE_PIPELINE_STATE_DESC*, 0, 0, riid, ppv); first seen from
-// XboxBvhBuilder.dll, followed by SetName on the result. The bytecode is console GPU code, not DXIL,
-// so no desktop pipeline is built: the result is a placeholder PipelineState until shader translation
-// exists. Logs the root signature, bytecode address, length and first 32 bytes.
-HRESULT __stdcall device_create_compute_pipeline_x(Wrapper*, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, u64 extra0,
+// XboxBvhBuilder.dll, followed by SetName on the result. The captured container is Scarlett DXIL in
+// a DXBC wrapper. In render mode the signed desktop retarget is loaded from X2W_SHADER_CACHE; when
+// the cache entry is missing, refused or invalid the call keeps the historical placeholder and logs
+// the reason. Without X2W_D3D12_RENDER the placeholder path is unchanged.
+HRESULT __stdcall device_create_compute_pipeline_x(Wrapper* self, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, u64 extra0,
                                                    u64 extra1, const GUID* iid, void** out)
 {
     char text[48];
@@ -2637,11 +2723,20 @@ HRESULT __stdcall device_create_compute_pipeline_x(Wrapper*, const D3D12_COMPUTE
     static LONG calls;
     if (first_calls(calls, 24))
         log("x2w-d3d12 Device::slot62(CreateComputePipelineState?) root=%p cs=%p len=0x%llx node=0x%x flags=0x%x extra=0x%llx,0x%llx "
-            "riid=%s -> placeholder [%s]", static_cast<void*>(desc->pRootSignature), desc->CS.pShaderBytecode,
+            "riid=%s [%s]", static_cast<void*>(desc->pRootSignature), desc->CS.pShaderBytecode,
             static_cast<unsigned long long>(desc->CS.BytecodeLength), desc->NodeMask, desc->Flags, extra0, extra1, text, bytes);
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
+    void* real = nullptr;
+    if (SUCCEEDED(create_compute_pipeline_cached(self, desc, &real)) && real) {
+        *out = real;
+        return S_OK;
+    }
+    static LONG placeholders;
+    if (first_calls(placeholders, 24))
+        log("x2w-d3d12 Device::slot62 -> placeholder");
     *out = wrap(nullptr, pipeline_kind);
-    note_pipeline(static_cast<Wrapper*>(*out), 62, nullptr, desc, sizeof(*desc));
+    note_pipeline(static_cast<Wrapper*>(*out), 62, nullptr, desc, sizeof(*desc), nullptr, nullptr,
+                  PipelineClass::compute);
     return S_OK;
 }
 
@@ -2955,11 +3050,13 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
-            "textures uploaded %ld (%ld KiB, unreadable %ld)", render_resets,
+            "textures uploaded %ld (%ld KiB, unreadable %ld), compute pipelines %ld (refused %ld, requested %ld), "
+            "compute dispatches %ld (skipped %ld)", render_resets,
             render_reset_failures, render_closes, render_clears, render_executes, render_draws, render_draws_skipped,
             translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
             null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], textures_uploaded,
-            texture_bytes_uploaded, textures_unreadable);
+            texture_bytes_uploaded, textures_unreadable, compute_pipelines_real, compute_pipelines_refused,
+            compute_pipelines_requested, compute_dispatches, compute_dispatches_skipped);
     if (render_mode() && frame % 300 == 0) {
         // Which command-list slots the title called in the last 300 frames, per frame.
         char line[2048];
@@ -3093,20 +3190,28 @@ void build_tables()
         list_typed[52] = reinterpret_cast<ListTyped>(&list_clear_target);
         list_typed[139] = reinterpret_cast<ListTyped>(&list_reset);
         list_typed[12] = reinterpret_cast<ListTyped>(&list_draw);
+        list_typed[13] = reinterpret_cast<ListTyped>(&list_draw_indexed);
+        list_typed[14] = reinterpret_cast<ListTyped>(&list_dispatch);
         list_typed[20] = reinterpret_cast<ListTyped>(&list_topology);
         list_typed[21] = reinterpret_cast<ListTyped>(&list_viewports);
         list_typed[22] = reinterpret_cast<ListTyped>(&list_scissors);
         list_typed[23] = reinterpret_cast<ListTyped>(&list_blend_factor);
         list_typed[25] = reinterpret_cast<ListTyped>(&list_pipeline);
         list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
+        list_typed[33] = reinterpret_cast<ListTyped>(&list_compute_root_signature);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);
-        list_typed[44] = reinterpret_cast<ListTyped>(&list_root_srv);
-        list_typed[50] = reinterpret_cast<ListTyped>(&list_targets);
-        list_typed[13] = reinterpret_cast<ListTyped>(&list_draw_indexed);
+        list_typed[35] = reinterpret_cast<ListTyped>(&list_compute_root_table);
         list_typed[36] = reinterpret_cast<ListTyped>(&list_table);
+        list_typed[37] = reinterpret_cast<ListTyped>(&list_compute_root_constant);
+        list_typed[39] = reinterpret_cast<ListTyped>(&list_compute_root_constants);
         list_typed[40] = reinterpret_cast<ListTyped>(&list_root_constants);
+        list_typed[41] = reinterpret_cast<ListTyped>(&list_compute_root_cbv);
+        list_typed[43] = reinterpret_cast<ListTyped>(&list_compute_root_srv);
+        list_typed[44] = reinterpret_cast<ListTyped>(&list_root_srv);
+        list_typed[45] = reinterpret_cast<ListTyped>(&list_compute_root_uav);
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
+        list_typed[50] = reinterpret_cast<ListTyped>(&list_targets);
     }
     tables[device_kind][16] = reinterpret_cast<void*>(&device_create_root_signature);
 
@@ -3152,6 +3257,29 @@ void note_texture_write(void* base, UINT bc7_width, UINT bc7_height)
     ReleaseSRWLockExclusive(&written_lock);
 }
 }  // namespace
+
+#include "startup_stubs/d3d12_compute_native_bridge.inl"
+
+extern "C" __declspec(dllexport) std::uint64_t x2w_d3d12_compute_cache_key(const void* data, std::size_t bytes)
+{
+    return compute_cache_key(data, bytes);
+}
+
+extern "C" __declspec(dllexport) long x2w_d3d12_compute_dispatches()
+{
+    return compute_dispatches;
+}
+
+extern "C" __declspec(dllexport) long x2w_d3d12_compute_skipped_dispatches()
+{
+    return compute_dispatches_skipped;
+}
+
+extern "C" __declspec(dllexport) long x2w_d3d12_pipeline_real(void* pipeline)
+{
+    Wrapper* w = as_wrapper(pipeline);
+    return w && w->own().kind == pipeline_kind && w->own().real ? 1 : 0;
+}
 
 void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
 {

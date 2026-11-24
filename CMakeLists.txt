@@ -193,10 +193,14 @@ add_test(NAME windows_placeholder_partition COMMAND windows_placeholder_partitio
 
 # Desktop d3d12_xs.dll for the package DLLs' two named d3d12_xs root-signature imports.
 add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12x_device_slots.cpp
-    src/d3d12_xs_iids.cpp src/d3d12_xs_shim.def src/startup_stubs/d3d12_xs_device.cpp)
+    src/d3d12_xs_iids.cpp src/d3d12_xs_shim.def src/startup_stubs/d3d12_xs_device.cpp
+    src/startup_stubs/d3d12_compute_native.cpp)
 set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
 target_include_directories(d3d12_xs_shim PRIVATE src)
 target_compile_features(d3d12_xs_shim PRIVATE cxx_std_17)
+# The fixture-only native cache bridge (#1412, N2C) is compiled into the shim only. The other
+# targets that include d3d12_xs_device.cpp keep the production translation unit unchanged.
+target_compile_definitions(d3d12_xs_shim PRIVATE X2W_NATIVE_COMPUTE_FIXTURE_BRIDGE=1)
 target_link_libraries(d3d12_xs_shim PRIVATE d3d12)
 
 # Fixture-only desktop xgameruntime.dll. The single X-macro table in
@@ -448,6 +452,50 @@ add_executable(startup_stream_consumer tests/startup_stream_consumer.cpp tests/s
     tests/startup_address_srv.cpp)
 target_compile_features(startup_stream_consumer PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_consumer PRIVATE d3d12_xs_shim startup_stub_xg_xs d3d12 dxgi)
+
+add_executable(startup_compute_consumer tests/startup_compute_consumer.cpp)
+target_compile_features(startup_compute_consumer PRIVATE cxx_std_17)
+target_link_libraries(startup_compute_consumer PRIVATE d3d12_xs_shim d3d12 dxgi)
+
+# Native compute cache consumer (#1412, Stage 4C / N2). The test compiles its own copy of the
+# bounded parser so record/manifest controls run without the shim; the fixture-only bridge is
+# exercised through the shim exports.
+add_executable(startup_compute_native tests/startup_compute_native.cpp
+    src/startup_stubs/d3d12_compute_native.cpp)
+target_include_directories(startup_compute_native PRIVATE src)
+target_compile_features(startup_compute_native PRIVATE cxx_std_17)
+target_link_libraries(startup_compute_native PRIVATE d3d12_xs_shim d3d12 dxgi)
+# The accepted revision-2 cache is a machine-local artifact under out/; the binary returns 77 when
+# it or a requested adapter is absent, so registration stays unconditional.
+foreach(variant IN ITEMS controls warp hardware debug)
+    add_test(NAME startup_compute_native_${variant} COMMAND startup_compute_native ${variant}
+        "${CMAKE_CURRENT_SOURCE_DIR}/out/stage4b-hardening/cache"
+        "${CMAKE_CURRENT_SOURCE_DIR}/out/stage4b/cache")
+    set_tests_properties(startup_compute_native_${variant} PROPERTIES TIMEOUT 240
+        SKIP_RETURN_CODE 77)
+endforeach()
+set_tests_properties(startup_compute_native_debug PROPERTIES
+    ENVIRONMENT "X2W_D3D12_DEBUG=1;X2W_D3D12_PERMISSIVE=1")
+
+# Native compute Dispatch + GPU readback (#1412, Stage 4D / N3). Separate from the N2 PSO-only
+# tests and from the frozen slot-62 selection.
+add_executable(startup_compute_native_dispatch tests/startup_compute_native_dispatch.cpp
+    src/startup_stubs/d3d12_compute_native.cpp)
+target_include_directories(startup_compute_native_dispatch PRIVATE src)
+target_compile_features(startup_compute_native_dispatch PRIVATE cxx_std_17)
+target_link_libraries(startup_compute_native_dispatch PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(variant IN ITEMS warp hardware)
+    add_test(NAME startup_compute_native_dispatch_${variant}
+        COMMAND startup_compute_native_dispatch ${variant}
+            "${CMAKE_CURRENT_SOURCE_DIR}/out/stage4b-hardening/cache")
+    set_tests_properties(startup_compute_native_dispatch_${variant} PROPERTIES TIMEOUT 300
+        SKIP_RETURN_CODE 77)
+    add_test(NAME startup_compute_native_dispatch_debug_${variant}
+        COMMAND startup_compute_native_dispatch ${variant}
+            "${CMAKE_CURRENT_SOURCE_DIR}/out/stage4b-hardening/cache" debug)
+    set_tests_properties(startup_compute_native_dispatch_debug_${variant} PROPERTIES TIMEOUT 300
+        SKIP_RETURN_CODE 77 ENVIRONMENT "X2W_D3D12_DEBUG=1;X2W_D3D12_PERMISSIVE=1")
+endforeach()
 
 # Console queue Wait (slot 17) waits on the GPU instead of signalling the fence.
 add_executable(startup_queue_wait tests/startup_queue_wait.cpp)
@@ -1401,6 +1449,13 @@ if(EXISTS "${INTAKE_PYTHON}")
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")
+    foreach(backend IN ITEMS warp hardware)
+        add_test(NAME startup_compute_${backend} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_check.py"
+            "$<TARGET_FILE:startup_compute_consumer>" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:root_probe>" "$<TARGET_FILE:root_device_probe>" "${backend}")
+        set_tests_properties(startup_compute_${backend} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    endforeach()
     foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_stream_draw_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_draw_check.py"
