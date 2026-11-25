@@ -744,6 +744,20 @@ OperationResult run_check_pixel_gather(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// A comparison gather needs a view format that advertises SHADER_GATHER_COMPARISON. R32_FLOAT does
+// on both WARP and hardware; R32G32B32A32_FLOAT does not, so the ordinary gather case cannot be reused.
+OperationResult run_check_pixel_compare_gather(const OperationContext& ctx)
+{
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{
+        DXGI_FORMAT_R32_FLOAT, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE};
+    if (FAILED(ctx.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+        !(support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON))
+        return {OutcomeKind::skip, "R32_FLOAT comparison gather support unavailable"};
+    check_pixel_compare_gather(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
+                               ctx.argc == 7 ? ctx.argv[6] : nullptr);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_check_pixel_case(const OperationContext& ctx)
 {
     check_translated_pixel(ctx.device, ctx.argv[3], false, ctx.argv[4], D3D12_COLOR_WRITE_ENABLE_ALL,
@@ -1490,6 +1504,7 @@ const OperationSpec kOperations[] = {
     {"--sampled-coverage", 5, 5, nullptr, kNoGate, run_sampled_coverage},
     {"--check-pixel-compare", 5, 5, nullptr, kNoGate, run_check_pixel_compare},
     {"--check-pixel-gather", 5, 5, nullptr, kNoGate, run_check_pixel_gather},
+    {"--check-pixel-compare-gather", 6, 7, nullptr, kNoGate, run_check_pixel_compare_gather},
     {"--check-pixel-case", 5, 6, nullptr, kNoGate, run_check_pixel_case},
     {"--check-pixel-case-rg", 5, 5, nullptr, kNoGate, run_check_pixel_case_rg},
     {"--compute-to-pixel", 6, 7, nullptr, kNoGate, run_compute_to_pixel},

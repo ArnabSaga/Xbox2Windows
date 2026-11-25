@@ -1934,6 +1934,53 @@ class Stage:
         for i, component in enumerate('xyzw', dst[1]):
             self.set_v(i, 'U(t.%s)' % component)
 
+    def op_image_gather4_c_lz(self, ops, mods):
+        """image_gather4_c_lz: four red-channel depth comparisons at view mip zero.
+
+        The address dwords are the reference, then u and v, as on the hardware gather. The comparison
+        function and the depth compare live in the constant sampler, so the guest words are bound as a
+        SamplerComparisonState and the sample profile is the one pixel_aot.check_gather_sampler already
+        checks for comparison gathers. Only red is in contract: gather4_c compares the resource's red
+        component and D3D's gather4_c takes a single-component view.
+        """
+        name = 'image_gather4_c_lz'
+        if self.kind != 'ps' or len(ops) != 4:
+            raise Unsupported('%s requires a pixel stage and four operands' % name)
+        for modifier in mods:
+            if not (modifier.startswith(('dim:', 'dmask:')) or modifier in ('dlc', 'glc', 'slc')):
+                raise Unsupported('%s modifier %s' % (name, modifier))
+        if [m for m in mods if m.startswith('dim:')] != ['dim:SQ_RSRC_IMG_2D']:
+            raise Unsupported('%s requires a 2D texture' % name)
+        masks = [m for m in mods if m.startswith('dmask:')]
+        if masks != ['dmask:0x1']:
+            raise Unsupported('%s requires red dmask 0x1' % name)
+        dst, addr, image, sampler = (reg_range(ops[i]) for i in (0, 1, 2, 3))
+        if not dst or dst[0] != 'v' or dst[2] - dst[1] != 3 or dst[2] > 255:
+            raise Unsupported('%s requires four destination registers' % name)
+        if not addr or addr[0] != 'v' or addr[2] - addr[1] != 2 or addr[2] > 255:
+            raise Unsupported('%s requires three contiguous address registers' % name)
+        if not image or image[0] != 's' or image[2] - image[1] != 7 or image[2] > 105:
+            raise Unsupported('%s requires eight image descriptor registers' % name)
+        if not sampler or sampler[0] != 's' or sampler[2] - sampler[1] != 3 or sampler[2] > 105:
+            raise Unsupported('%s requires four sampler descriptor registers' % name)
+        words = self.const_words(ops[3])
+        if words is None:
+            raise Unsupported('%s requires a constant sampler' % name)
+        from pixel_aot import check_gather_sampler
+        try:
+            # Both the guest _lz and D3D gather compare at mip zero of the bound view.
+            check_gather_sampler(words, 1, comparison=True)
+        except ValueError as error:
+            raise Unsupported('%s sampler: %s' % (name, error)) from error
+        tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2d')
+        smp = self.pipe.sampler(tuple(words), comparison=True)
+        reference, u, v = (self.f('v%d' % i) for i in range(addr[1], addr[2] + 1))
+        # The gather is read before any destination register is written, so an alias between the address
+        # and destination ranges keeps the original operands.
+        self.emit('t = %s.GatherCmp(%s, float2(%s, %s), %s);' % (tex, smp, u, v, reference))
+        for i, component in enumerate('xyzw', dst[1]):
+            self.set_v(i, 'U(t.%s)' % component)
+
     def op_v_cvt_i32_f32(self, ops, mods):
         if mods:
             raise Unsupported('v_cvt_i32_f32 with modifiers')

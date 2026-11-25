@@ -12102,6 +12102,86 @@ cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_image_gather_lz(_warp|_hardware)?$' -V
 ```
 
+## Startup translator: fixed-mip 2D comparison gathers
+
+The startup pixel translator lowers gfx1013 `image_gather4_c_lz` for a 2D
+texture with three contiguous address registers: the comparison reference
+first, then `u` and `v`. Only red `dmask:0x1` is in contract, because
+`gather4_c` compares the resource's red component and Direct3D's
+`gather4_c` takes a single-component view. The four per-tap comparison
+results go to consecutive destination registers in the same order as the
+ordinary gather: lower left, lower right, upper right, upper left.
+
+The comparison function lives in the sampler's word 0 bits 14:12
+(`SQ_TEX_DEPTH_COMPARE`, NEVER through ALWAYS in D3D12 comparison order).
+D3D compares `reference {function} texel.R` and returns `0.0` or `1.0` for
+each tap. The translator binds the guest's own four sampler words as a
+`SamplerComparisonState` and writes `smpc N w0 w1 w2 w3`; it reuses
+`pixel_aot.check_gather_sampler(..., comparison=True)`, so the profile is a
+constant sampler with normalized coordinates, CLAMP_LAST_TEXEL in X and Y,
+bilinear XY, point mip filtering, zero MIN_LOD and bias, no anisotropy and
+no TRUNC_COORD. All eight comparison functions are accepted and each has its
+own manifest line. Cache-policy bits (`glc`, `slc`, `dlc`) do not change the
+compared value; MAX_LOD is accepted but never carried into the static
+sampler, because a fixed-mip gather never selects a level.
+
+Both the guest `_lz` instruction and Direct3D gather compare at mip zero of
+the bound view. For a view that starts at a later resource mip, view mip
+zero is that first visible mip. The lowering emits
+`t = r0.GatherCmp(q0, float2(F(u), F(v)), F(reference));` and writes
+`t.x` through `t.w` to the four destination registers after the gather is
+read, so overlapping address and destination registers keep their original
+operands.
+
+The translator does not decode the image descriptor's format. The verified
+fixture contract is a single-component 32-bit float depth view
+(`R32_FLOAT`) with the reference and texels in `[0, 1]`; that is also the
+format that advertises `D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON`
+(RGBA32_FLOAT does not). Reference quantization, denormal and NaN behavior
+outside that contract, console equivalence and title-level execution are not
+claimed. The implicit-LOD, explicit-LOD, offset, array and non-red forms,
+sampler heaps and non-constant samplers stay refused by name.
+
+The source-built fixture is assembled from gfx1013 with LLVM 15 and decoded
+through the startup decoder:
+`0xf13c0108 0x00c40400` for
+`image_gather4_c_lz v[4:7], v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D`.
+`tests/startup_image_gather_c_lz_check.py` also compiles the translated
+stage as FXC `ps_5_1` and DXC `ps_6_0`, draws an 8×8 target with up to three
+view mips, and compares all 64 pixels and four channels bitwise against a
+CPU reference computed from the Direct3D gather footprint. The positive
+matrix distinguishes all four destination positions: each position has its
+own result sequence across the cases, and the check that requires four
+distinct sequences fails on an earlier matrix whose lower-right and
+upper-right references coincided. On WARP
+10.0.26100.9818 and an Intel Iris Xe Graphics (driver 31.0.101.5333) on
+Windows 11 build 26300, both compiler paths passed all 23 positive cases and
+all 8 output-sensitivity mutants with the debug layer enabled and zero errors
+or warnings. The evidence run keeps, for every executed case, its own
+generated HLSL, compiled object, sampler and resource manifest, texture data
+and renderer log. The
+refusal controls cover zero, multi-bit and non-red DMASK, non-2D dimensions,
+destination/address/descriptor widths and ranges, NSA, A16/D16/TFE/LWE/R128/
+unorm/reserved modifiers, malformed sampler words (15 sets) and the still
+refused gather variants. The control that removes the destination-width,
+red-DMASK or sampler-profile guard makes the corresponding malformed form
+translate, so the checks cannot pass without those guards. One sensitivity
+control swaps the lower-right and upper-right destination lanes in a
+temporary copy of the translated stage; it compiles, draws and is rejected
+by the comparator. The wrong-visible-mip control changes the expectation
+only and is not a wrong-SRV mutation. This is a bounded
+slice; the whole of the comparison-gather issue is not resolved, and the
+form-coverage denominator is unchanged.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^startup_image_gather_c_lz(_warp|_hardware)?$' -V
+```
+
+```bash
+python3 -B tests/startup_image_gather_c_lz_check.py --llvm-mc llvm-mc-15
+```
+
 ## Startup translator: per-lane bit operations
 
 The startup scalar lowering also covers `s_lshl1_add_u32` through
