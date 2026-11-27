@@ -8,6 +8,7 @@
 #define X2W_TRAP_MODULE "XCRDAPI.dll"
 #define X2W_TRAP_MODULE_ID 4
 #include "startup_stubs/trap.h"
+#include "startup_stubs/profile_zone.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/inflate.h"
 #include "startup_stubs/dstorage_error_record.h"
@@ -74,6 +75,24 @@ struct QueueObject : Object {
     HANDLE error_event = nullptr;
 };
 
+// Live stand-in objects by kind, and running queue workers. The lifetime fixture reads them through
+// x2w_xcrdapi_live_objects and x2w_xcrdapi_live_workers to prove that a final Release frees the
+// object and that the queue's worker has left (#2788).
+LONG live_by_kind[4];
+LONG live_workers;
+
+// Test-only mutant (#2788): X2W_TEST_XCRDAPI_LIFETIME_MUTANT=naive deletes at final Release without
+// stopping the worker or retaining the objects a queue entry uses. The fixture must reject it.
+bool naive_lifetime_mutant() noexcept
+{
+    static const bool naive = [] {
+        char text[16];
+        const DWORD length = GetEnvironmentVariableA("X2W_TEST_XCRDAPI_LIFETIME_MUTANT", text, sizeof(text));
+        return length == 5 && std::memcmp(text, "naive", 5) == 0;
+    }();
+    return naive;
+}
+
 // A queue entry as enqueued: a request (its 0x48 bytes copied, and a snapshot of its destination page
 // tokens), a status entry or a fence signal. Entries run in order on the queue's worker after Submit,
 // like DirectStorage; a destination page token that was 0 at enqueue is read again at the entry's turn
@@ -90,6 +109,7 @@ struct Entry {
     std::unique_ptr<ULONG_PTR[]> tokens;
     std::size_t token_count = 0;
     Object* array;
+    Object* source;  // request: the file the entry reads, retained while the entry is pending
     unsigned index;
     void* fence;
     u64 value;
@@ -114,6 +134,10 @@ struct QueueWork {
     struct Unrecorded* deferred_head = nullptr;  // snapshot of unrecorded entries, in order; guarded by mutex
     struct Unrecorded* deferred_tail = nullptr;
     bool completing = false;     // a thread owns completion of snapshot entries, so they stay in order; guarded by mutex
+    bool stopping = false;       // final Release asked the worker to leave; guarded by mutex
+    bool destroy_on_worker = false;  // the final Release ran on the worker itself; guarded by mutex
+    HANDLE thread = nullptr;     // kept for the join; closed by the releasing thread, guarded by the setup mutex
+    DWORD thread_id = 0;         // guarded by the setup mutex
     std::condition_variable drained;  // signaled when the worker finishes an entry
     u64 submitted_total = 0;          // entries ever moved to `submitted`, guarded by mutex
     u64 finished_total = 0;           // entries the worker has finished running, guarded by mutex
@@ -151,15 +175,41 @@ static bool has_zlib_header(const unsigned char* bytes, std::size_t size)
     return true;
 }
 
+// True when every page of [start, end) is resident and plain read-write: valid in the working set, PAGE_READWRITE
+// or PAGE_EXECUTE_READWRITE, no guard bit. One QueryWorkingSetEx per 512 pages, so the cost follows the
+// destination's size, not the region's. Reads attributes only; no page is touched.
+static bool resident_read_write(std::uintptr_t start, std::uintptr_t end)
+{
+    PSAPI_WORKING_SET_EX_INFORMATION pages[512];
+    std::uintptr_t page = start & ~std::uintptr_t{0xFFF};
+    while (page < end) {
+        DWORD count = 0;
+        for (; count < 512 && page < end; ++count, page += 0x1000) pages[count].VirtualAddress = reinterpret_cast<void*>(page);
+        if (!QueryWorkingSetEx(GetCurrentProcess(), pages, count * sizeof(pages[0]))) return false;
+        for (DWORD i = 0; i < count; ++i) {
+            const auto& page_info = pages[i].VirtualAttributes;
+            const DWORD protect = static_cast<DWORD>(page_info.Win32Protection);
+            if (!page_info.Valid || page_info.Bad || (protect & PAGE_GUARD) ||
+                ((protect & 0xFF) != PAGE_READWRITE && (protect & 0xFF) != PAGE_EXECUTE_READWRITE))
+                return false;
+        }
+    }
+    return true;
+}
+
 // True when every byte of [destination, destination + bytes) is committed and writable, with no guard or
-// no-access page in between. Walks the regions one VirtualQuery at a time, so a destination that spans
-// regions of different protection is judged page by page. Nothing is written or touched.
+// no-access page in between. Nothing is written or touched. Resident read-write pages are accepted from
+// their working-set attributes; any other page (not resident, copy-on-write, guard, no access) sends the
+// destination to the VirtualQuery walk, which judges it region by region. That walk is slow on the title's
+// large regions: each query scans to the end of the region (#2684).
 static bool destination_writable(const void* destination, std::size_t bytes)
 {
     if (bytes == 0) return true;
     std::uintptr_t cursor = reinterpret_cast<std::uintptr_t>(destination);
     if (!destination || bytes > UINTPTR_MAX - cursor) return false;
+    x2w_local::commit_lazy(destination, bytes);  // lazily mapped physical pages (X2W_XMEM_LAZY_COMMIT)
     const std::uintptr_t end = cursor + bytes;
+    if (resident_read_write(cursor, end)) return true;
     while (cursor < end) {
         MEMORY_BASIC_INFORMATION info{};
         if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) || info.State != MEM_COMMIT)
@@ -177,8 +227,8 @@ static bool destination_writable(const void* destination, std::size_t bytes)
 }
 
 // Return the exact queued requests that continue this stream in this submission, in queue order.
-// Status entries are skipped, and any unrelated request, submission boundary, or non-matching
-// source/offset ends the continuation chain.
+// Status entries and requests for unrelated files are skipped. In the same file, any non-matching
+// size, non-consecutive offset, or submission boundary ends the continuation chain (Refs #1136, #1144, #1198, #1214).
 static std::vector<u64> following_chunk_ids(Object* self, u64 current_submission_id, u64 source, u64 offset,
                                             unsigned source_size, unsigned destination_size, std::size_t total_size)
 {
@@ -196,17 +246,22 @@ static std::vector<u64> following_chunk_ids(Object* self, u64 current_submission
         }
         if (e.type != Entry::request) continue;
         const u64 e_options = *reinterpret_cast<const u64*>(e.bytes);
+        const u64 e_source = *reinterpret_cast<const u64*>(e.bytes + 0x20);
+        // Skip requests for other files (interleaving across unrelated files within one submission).
+        if (e_source != source) {
+            continue;
+        }
+        // For the same file, requests must strictly be compressed file requests continuing this sequence.
         if (!(e_options & 1) || (e_options & 0x400000)) {
             break;
         }
-        const u64 e_source = *reinterpret_cast<const u64*>(e.bytes + 0x20);
         const u64 e_offset = *reinterpret_cast<const u64*>(e.bytes + 0x28);
         const unsigned e_source_size = *reinterpret_cast<const unsigned*>(e.bytes + 0x30);
-        if (e_source != source || e_source_size != source_size || e_offset != expected) {
+        if (e_source_size != source_size || e_offset != expected) {
             break;
         }
         const u64 delta = expected - offset;
-        if (delta >= total_size) {
+        if (delta >= total_size || delta > UINT32_MAX) {
             break;
         }
         ids.push_back(e.id);
@@ -272,15 +327,23 @@ long __stdcall query_interface(Object* self, const GUID* riid, void** out)
     return S_OK;
 }
 unsigned long __stdcall add_ref(Object* self) { return static_cast<unsigned long>(InterlockedIncrement(&self->refs)); }
+
+void destroy_object(Object* self) noexcept;
+
+// Final Release of a queue: stop the worker, wait for it to leave, then drop the entries that never
+// ran. Returns true when the worker owns the destruction (Release ran on the worker itself).
+// Defined after the entry helpers below.
+bool shutdown_queue(Object* self);
+
 unsigned long __stdcall release(Object* self)
 {
     const auto refs = static_cast<unsigned long>(InterlockedDecrement(&self->refs));
-    if (refs == 0 && self->kind == queue) {
-        auto& object = *static_cast<QueueObject*>(self);
-        const std::lock_guard guard(object.error_mutex);
-        if (object.error_event) CloseHandle(std::exchange(object.error_event, nullptr));
-    }
-    return refs;
+    if (refs != 0) return refs;
+    // The factory is a process singleton: it stays alive for the life of the process (#2788).
+    if (self->kind == factory) return 0;
+    if (self->kind == queue && !naive_lifetime_mutant() && shutdown_queue(self)) return 0;
+    destroy_object(self);
+    return 0;
 }
 
 void** make_table(unsigned kind);
@@ -295,7 +358,51 @@ Object* make(unsigned kind)
     object->kind = kind;
     object->refs = 1;
     object->handle = INVALID_HANDLE_VALUE;
+    InterlockedIncrement(&live_by_kind[kind / 0x20 - 1]);
     return object;
+}
+
+void destroy_object(Object* self) noexcept
+{
+    const unsigned index = self->kind / 0x20 - 1;
+    if (self->kind == queue) {
+        auto* object = static_cast<QueueObject*>(self);
+        {
+            const std::lock_guard guard(object->error_mutex);
+            if (object->error_event) CloseHandle(std::exchange(object->error_event, nullptr));
+        }
+        delete object;
+    } else if (self->kind == file) {
+        auto* object = static_cast<FileObject*>(self);
+        if (object->handle != INVALID_HANDLE_VALUE) CloseHandle(std::exchange(object->handle, INVALID_HANDLE_VALUE));
+        delete object;
+    } else if (self->kind == status) {
+        delete[] self->results;
+        delete self;
+    } else {
+        return;  // the factory singleton is never freed
+    }
+    InterlockedDecrement(&live_by_kind[index]);
+}
+
+// The status array an entry completes and the file a request reads must outlive the guest's Release
+// while the entry is pending: the entry owns one reference on each until it is consumed (#2788).
+void retain_entry_object(Object* object) noexcept
+{
+    if (object && !naive_lifetime_mutant()) InterlockedIncrement(&object->refs);
+}
+
+void release_entry_object(Object* object) noexcept
+{
+    if (object && !naive_lifetime_mutant()) release(object);
+}
+
+void release_entry(Entry& entry) noexcept
+{
+    release_entry_object(entry.source);
+    entry.source = nullptr;
+    release_entry_object(entry.array);
+    entry.array = nullptr;
 }
 
 // Factory slot 4, PC IDStorageFactory::OpenFile(PCWSTR path, REFIID riid, void** ppv).
@@ -303,13 +410,17 @@ long __stdcall factory_open_file(Object*, const wchar_t* path, const GUID* riid,
 {
     char id[48];
     guid_text(riid, id, sizeof(id));
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!path) {
+        log("x2w-dstorage Factory::OpenFile path=(null) riid=%s -> E_INVALIDARG", id);
+        return E_INVALIDARG;
+    }
     HANDLE handle = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                                 FILE_ATTRIBUTE_NORMAL, nullptr);
     const DWORD error = handle == INVALID_HANDLE_VALUE ? GetLastError() : 0;
     log("x2w-dstorage Factory::OpenFile path=\"%ls\" riid=%s -> %s (err %lu)", path ? path : L"(null)", id,
         handle == INVALID_HANDLE_VALUE ? "fail" : "ok", error);
-    if (!out) return E_POINTER;
-    *out = nullptr;
     if (handle == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(error);
     auto* object = static_cast<FileObject*>(make(file));
     object->handle = handle;
@@ -355,8 +466,10 @@ long __stdcall factory_create_queue(Object*, const unsigned char* desc, const GU
     log("x2w-dstorage Factory::CreateQueue desc=[%s] name=\"%s\" riid=%s", bytes,
         name && x2w_local::readable(name, 1) ? name : "?", id);
     if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!desc) return E_INVALIDARG;
     Object* object = make(queue);
-    object->capacity = desc ? *reinterpret_cast<const std::uint16_t*>(desc + 8) : 0;
+    object->capacity = *reinterpret_cast<const std::uint16_t*>(desc + 8);
     *out = object;
     return S_OK;
 }
@@ -373,9 +486,10 @@ void __stdcall file_close(Object* self)
 long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 {
     const BOOL ok = info && GetFileInformationByHandle(self->handle, info);
+    const DWORD error = ok ? 0 : GetLastError();  // before log(), whose Win32 calls overwrite it
     log("x2w-dstorage File::GetFileInformation -> %s size=0x%llx", ok ? "ok" : "fail",
         ok ? (static_cast<unsigned long long>(info->nFileSizeHigh) << 32) | info->nFileSizeLow : 0ull);
-    return ok ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+    return ok ? S_OK : HRESULT_FROM_WIN32(error);
 }
 
 // Queue slot 3, EnqueueRequest(request*) by the PC numbering. Request layout from the title's builder
@@ -451,6 +565,18 @@ StorageFailure read_failure_cause(const Object* file_object, u64 offset, u64 cou
     const bool known = file_object && file_object->kind == file && file_object->handle != INVALID_HANDLE_VALUE &&
                        GetFileSizeEx(file_object->handle, &length) && length.QuadPart >= 0;
     return read_failure_cause(known, known ? static_cast<u64>(length.QuadPart) : 0, offset, count);
+}
+
+// The status HRESULT a failed request reports, by cause. A destination too small for the data and a
+// read at or past the end of the file are told apart; every other cause stays E_FAIL.
+HRESULT failure_result(StorageFailure cause) noexcept
+{
+    switch (cause) {
+    case StorageFailure::destination_capacity: return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    case StorageFailure::read_at_or_past_eof:
+    case StorageFailure::read_crossing_eof: return HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
+    default: return E_FAIL;
+    }
 }
 
 // The heartbeat's line of failure causes. It is a line of its own after the totals line, whose text
@@ -555,8 +681,56 @@ void log_bcpack_summary()
         format_counts(blank, sizeof(blank), bcpack_blank));
 }
 
+// Try to serve an identified continuation slice of an already-inflated chunked stream from the in-memory cache
+// (Refs #1136, #1144, #1198, #1214). Returns true if this request was matched as a continuation slice.
+static bool try_serve_cached_continuation(Object* self, u64 source, u64 offset, unsigned source_size,
+                                          unsigned destination_size, u64 entry_id,
+                                          std::vector<unsigned char>& output, std::size_t& decode_length,
+                                          const char*& outcome, StorageFailure& failure, const unsigned char*& data)
+{
+    if (!self || !self->work) return false;
+    QueueWork& work = *self->work;
+    const std::lock_guard guard(work.mutex);
+    for (auto it = work.cached_streams.begin(); it != work.cached_streams.end(); ++it) {
+        if (it->source == source && it->compressed_size == source_size && offset > it->base_offset) {
+            auto pos = std::find(it->continuation_ids.begin(), it->continuation_ids.end(), entry_id);
+            if (pos != it->continuation_ids.end()) {
+                const u64 delta = offset - it->base_offset;
+                const unsigned step = it->chunk_size ? it->chunk_size : 0x10000;
+                if ((delta % step) == 0 && delta < it->data.size() && delta <= UINT32_MAX) {
+                    const std::size_t available = it->data.size() - static_cast<std::size_t>(delta);
+                    if (destination_size > available) {
+                        outcome = "destination capacity exceeded";
+                        failure = StorageFailure::destination_capacity;
+                        data = nullptr;
+                        it->continuation_ids.erase(pos);
+                        if (it->continuation_ids.empty()) {
+                            work.cached_streams.erase(it);
+                        }
+                        return true;
+                    }
+                    const std::size_t slice_size = destination_size < available ? destination_size : available;
+                    if (slice_size > 0) {
+                        output.assign(it->data.begin() + delta, it->data.begin() + delta + slice_size);
+                        decode_length = slice_size;
+                        data = output.data();
+                        outcome = "inflated (slice from stream cache)";
+                        it->continuation_ids.erase(pos);
+                        if (it->continuation_ids.empty()) {
+                            work.cached_streams.erase(it);
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
 void execute_request(Object* self, const unsigned char* request, const ULONG_PTR* tokens, u64 entry_id, u64 submission_id)
 {
+    X2W_ZONE("DirectStorage request");
     if (!request) return;
     const u64 options = *reinterpret_cast<const u64*>(request);
     auto* const destination = *reinterpret_cast<unsigned char* const*>(request + 0x08);
@@ -567,7 +741,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     const bool memory_source = (options & memory_source_option) != 0;
     const unsigned compression = static_cast<unsigned>(options & 0xFF);
     static LONG logged;
-    if (InterlockedIncrement(&logged) <= 12) {
+    if (x2w_local::first_calls(logged, 12)) {
         char bytes[3 * 0x40 + 1] = "";
         for (int i = 0; i < 0x40; ++i) std::snprintf(bytes + 3 * i, 4, "%02x ", request[i]);
         log("x2w-dstorage Queue::EnqueueRequest [%s]", bytes);
@@ -585,6 +759,11 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     StorageFailure failure = StorageFailure::other;  // the heartbeat's cause, if the request fails
     std::vector<unsigned char> packed, output;
     const unsigned char* input = nullptr;
+    const unsigned char* data = nullptr;
+    std::size_t decode_length = source_size;
+    const std::size_t destination_capacity = destination_size;
+    bool written = false;
+
     if (options & ~known) {
         outcome = "unknown option bits, not done";
     } else if (!destination || !source_size) {
@@ -601,10 +780,6 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             failure = read_failure_cause(file_object, offset, source_size);
         }
     }
-    const unsigned char* data = nullptr;
-    std::size_t decode_length = source_size;
-    const std::size_t destination_capacity = destination_size;
-    bool written = false;
 
     if (input) {
         data = input;
@@ -612,19 +787,23 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             bool direct_decoded = false;
             bool decode_error = false;
             if (has_zlib_header(input, source_size)) {
-                // With BCPack after it, the inflated size is not given; the destination size bounds it.
-                // DirectStorage provides UncompressedSize at request + 0x38. When destination is smaller
-                // than the stream (e.g. 64 KiB tile/page target), allocate for the full uncompressed stream
-                // so single-pass inflate succeeds and verifies Adler32, then check capacity before writing.
-                const unsigned uncompressed_size = *reinterpret_cast<const unsigned*>(request + 0x38);
-                std::size_t target_size = (uncompressed_size > destination_size) ? uncompressed_size : destination_size;
-                if (bcpack) target_size = target_size * 2 + 0x10000;
+                // The public DSTORAGE_REQUEST layout has SourceSize at +0x30, IntermediateSize at +0x34 (the
+                // number of BCPack bytes when zlib and BCPack are both requested) and CancellationTag at
+                // +0x38. The tag is an arbitrary value, not a size, so no buffer is sized from it. A zlib-only
+                // request inflates to DestinationSize; with BCPack after it the inflated size is
+                // IntermediateSize, and the earlier destination-based bound is kept as the minimum.
+                const unsigned intermediate_size = *reinterpret_cast<const unsigned*>(request + 0x34);
+                std::size_t target_size = destination_size;
+                if (bcpack) {
+                    target_size = target_size * 2 + 0x10000;
+                    if (intermediate_size > target_size) target_size = intermediate_size;
+                }
                 output.resize(target_size);
                 std::size_t produced = 0;
                 bool ok = x2w_inflate::inflate_zlib(input, source_size, output.data(), output.size(), &produced);
                 if (!ok && output.size() < 0x80000) {
-                    // If destination_size was smaller than the uncompressed stream and uncompressed_size was unset,
-                    // expand up to 512 KiB to accommodate larger chunks.
+                    // If destination_size was smaller than the uncompressed stream, expand up to 512 KiB to
+                    // accommodate larger chunks.
                     std::size_t big_size = std::size_t{destination_size} * 8 + 0x40000;
                     if (big_size < 0x80000) big_size = 0x80000;
                     std::vector<unsigned char> big(big_size);
@@ -639,10 +818,11 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                     output.resize(produced);
                     bool cached_chunked = false;
                     // If the stream expanded beyond this request's destination and continuation chunks are queued
-                    // in this submission, scope the cache to those identified continuation requests and serve slice 0 (Refs #1136, #1214).
+                    // in this submission, scope the cache to those identified continuation requests and serve slice 0 (Refs #1136, #1144, #1198, #1214).
                     // BCPack streams are atomic multi-lane rANS payloads; they are not chunk-split continuation streams (Refs #1139).
                     if (!memory_source && !bcpack && produced > destination_size && self && self->work) {
-                        auto continuation_ids = following_chunk_ids(self, submission_id, source, offset, source_size, destination_size, produced);
+                        auto continuation_ids = following_chunk_ids(self, submission_id, source, offset, source_size,
+                                                                    destination_size, produced);
                         if (!continuation_ids.empty()) {
                             QueueWork& work = *self->work;
                             const std::lock_guard guard(work.mutex);
@@ -668,37 +848,12 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             // slice of an already-inflated chunked stream on this queue (Refs #1136, #1144, #1214).
             // A request presenting a zlib header that failed decode (e.g. damaged checksum) is an actual
             // decode error and must stay distinct from a proven continuation. Memory requests stay strictly on direct decode.
-            if (!direct_decoded && !decode_error && !memory_source && self && self->work) {
+            if (!direct_decoded && !decode_error && !memory_source && !bcpack && destination && source_size && self && self->work) {
                 auto* file_object = reinterpret_cast<Object*>(source);
-                if (file_object && file_object->kind == file && file_object->handle != INVALID_HANDLE_VALUE) {
-                    QueueWork& work = *self->work;
-                    const std::lock_guard guard(work.mutex);
-                    for (auto it = work.cached_streams.begin(); it != work.cached_streams.end(); ++it) {
-                        if (it->source == source && it->compressed_size == source_size && offset > it->base_offset) {
-                            auto pos = std::find(it->continuation_ids.begin(), it->continuation_ids.end(), entry_id);
-                            if (pos != it->continuation_ids.end()) {
-                                const u64 delta = offset - it->base_offset;
-                                const unsigned step = it->chunk_size ? it->chunk_size : 0x10000;
-                                if ((delta % step) == 0 && delta < it->data.size()) {
-                                    const std::size_t available = it->data.size() - delta;
-                                    // Handle short final destinations in multi-piece streams (Refs #1144)
-                                    const std::size_t slice_size = destination_size < available ? destination_size : available;
-                                    if (slice_size > 0 && destination_size <= available) {
-                                        output.assign(it->data.begin() + delta, it->data.begin() + delta + slice_size);
-                                        decode_length = slice_size;
-                                        data = output.data();
-                                        outcome = "inflated (slice from stream cache)";
-                                        direct_decoded = true;
-                                        it->continuation_ids.erase(pos);
-                                        if (it->continuation_ids.empty()) {
-                                            work.cached_streams.erase(it);
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                if (file_object && file_object->kind == file && file_object->handle != INVALID_HANDLE_VALUE &&
+                    try_serve_cached_continuation(self, source, offset, source_size, destination_size, entry_id,
+                                                  output, decode_length, outcome, failure, data)) {
+                    direct_decoded = true;
                 }
             }
 
@@ -707,7 +862,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 failure = StorageFailure::zlib;
                 data = nullptr;
                 static LONG diagnosed;
-                if (InterlockedIncrement(&diagnosed) <= 12) {
+                if (x2w_local::first_calls(diagnosed, 12)) {
                     unsigned h[4] = {};
                     for (unsigned i = 0; i < 4 && i < source_size; ++i) h[i] = input[i];
                     log("x2w-dstorage zlib failure: header %02x %02x %02x %02x (dest 0x%x, source 0x%x)",
@@ -715,9 +870,11 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 }
             }
         }
+    }
+    if (input) {
         bool bcpack_decoded = false;
         if (data && bcpack) {
-            if (bcpack == 7 || bcpack == 1) {
+            if (bcpack == 7 || bcpack == 1 || bcpack == 4 || bcpack == 5 || bcpack == 3) {
                 std::vector<unsigned char> decoded(destination_size);
                 std::size_t produced = 0;
                 if (x2w_bcpack::decode_bcpack(data, decode_length, bcpack, decoded.data(), decoded.size(), &produced)) {
@@ -809,11 +966,12 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     }
     const bool empty = std::strcmp(outcome, "empty") == 0;
     const bool failed = (data == nullptr || !written) && !empty;
-    if (failed) count_failure(failure, self, request);
+    const HRESULT result = failure_result(failure);
+    if (failed) count_failure(failure, self, request, result);
     if (!empty) count_page_request(request, failed);
-    if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
+    if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(result));
     static LONG summaries, failures;
-    if (InterlockedIncrement(&summaries) <= 12 || (failed && InterlockedIncrement(&failures) <= 12))
+    if (x2w_local::first_calls(summaries, 12) || (failed && x2w_local::first_calls(failures, 12)))
         log("x2w-dstorage   options=0x%llx dest=%p dest_size=0x%x source=0x%llx offset=0x%llx size=0x%x -> %s", options,
             static_cast<void*>(destination), destination_size, source, offset, source_size, outcome);
 }
@@ -837,7 +995,7 @@ void run_entry(Object* self, Entry& entry)
                 count_page_request(entry.bytes, true);
                 if (self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
                 static LONG unreadable;
-                if (InterlockedIncrement(&unreadable) <= 12)
+                if (x2w_local::first_calls(unreadable, 12))
                     log("x2w-dstorage   options=0x%llx page array %p (%zu entries) unreadable when the request runs -> failed", options,
                         static_cast<const void*>(title), entry.token_count);
                 return;
@@ -881,7 +1039,7 @@ void fail_entry(Object* self, const Entry& entry, const char* reason) noexcept
     if (entry.type == Entry::request) count_page_request(entry.bytes, true);
     InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
     static LONG reported;
-    if (InterlockedIncrement(&reported) <= 12)
+    if (x2w_local::first_calls(reported, 12))
         log("x2w-dstorage entry type %d failed: %s (options=0x%llx)", static_cast<int>(entry.type), reason,
             entry.type == Entry::request ? *reinterpret_cast<const unsigned long long*>(entry.bytes) : 0ull);
 }
@@ -892,6 +1050,8 @@ void complete_deferred(Object* self, QueueWork* work);
 
 bool deferred_pending(const QueueWork& work);
 
+void discard_entries(QueueWork* work) noexcept;
+
 DWORD WINAPI queue_worker(void* parameter)
 {
     on_queue_worker = true;
@@ -901,7 +1061,10 @@ DWORD WINAPI queue_worker(void* parameter)
         Entry entry;
         {
             std::unique_lock lock(work.mutex);
-            work.wake.wait(lock, [&] { return !work.submitted.empty() && !deferred_pending(work); });
+            work.wake.wait(lock, [&] {
+                return work.stopping || (!work.submitted.empty() && !deferred_pending(work));
+            });
+            if (work.stopping) break;
             entry = std::move(work.submitted.front());
             work.submitted.pop_front();
         }
@@ -925,6 +1088,7 @@ DWORD WINAPI queue_worker(void* parameter)
             copy_reason(reason, "unknown exception");
         }
         if (failed) fail_entry(self, entry, reason);
+        release_entry(entry);
         {
             const std::lock_guard guard(work.mutex);
             if (work.submitted.empty()) {
@@ -935,6 +1099,23 @@ DWORD WINAPI queue_worker(void* parameter)
         work.drained.notify_all();
         complete_deferred(self, &work);
     }
+    bool destroy = false;
+    {
+        const std::lock_guard guard(work.mutex);
+        destroy = work.destroy_on_worker;
+    }
+    if (destroy) {
+        // The final Release ran on this worker (a fence callback released the queue). The worker cannot
+        // join itself: it drops the entries that never ran and frees the queue as it exits.
+        discard_entries(&work);
+        self->work = nullptr;
+        delete &work;
+        destroy_object(self);
+        InterlockedDecrement(&live_workers);
+        return 0;
+    }
+    InterlockedDecrement(&live_workers);
+    return 0;
 }
 
 // Guards queue setup: building a queue's work, starting its worker and the unrecorded list.
@@ -979,8 +1160,10 @@ bool start_worker(Object* self, QueueWork* work)
         return false;
     }
     work->worker_started = true;
+    work->thread = worker;
+    work->thread_id = GetThreadId(worker);
+    InterlockedIncrement(&live_workers);
     ResumeThread(worker);
-    CloseHandle(worker);
     return true;
 }
 
@@ -992,11 +1175,20 @@ struct Unrecorded {
     u64 after;
     Entry::Type type;
     Object* array;
+    Object* source;  // request: the file the entry would read, retained until the node is dropped
     unsigned index;
     void* fence;
     u64 value;
     unsigned char bytes[sizeof(StorageRequest)];
 };
+
+void release_unrecorded(Unrecorded& node) noexcept
+{
+    release_entry_object(node.source);
+    node.source = nullptr;
+    release_entry_object(node.array);
+    node.array = nullptr;
+}
 
 // True while snapshot entries of an earlier Submit are ready or being completed by some thread. The
 // worker starts no newer entry then, so a deferred completion and a normal one keep the same order.
@@ -1048,13 +1240,25 @@ bool has_unrecorded(Object* self)
     return self->unrecorded_head != nullptr;
 }
 
-void defer_unrecorded(Object* self, const Entry& entry)
+void defer_unrecorded(Object* self, Entry& entry)
 {
-    auto* node = new (std::nothrow) Unrecorded{nullptr, 0, 0, entry.type, entry.array, entry.index, entry.fence, entry.value, {}};
+    auto* node = new (std::nothrow) Unrecorded{};
     if (!node) {
         fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
+        release_entry(entry);
         return;
     }
+    node->next = nullptr;
+    node->submission_id = 0;
+    node->after = 0;
+    node->type = entry.type;
+    node->array = entry.array;
+    node->source = entry.source;
+    node->index = entry.index;
+    node->fence = entry.fence;
+    node->value = entry.value;
+    entry.array = nullptr;
+    entry.source = nullptr;  // the node now owns the entry's references
     if (entry.type == Entry::request) std::memcpy(node->bytes, entry.bytes, sizeof node->bytes);
     const std::lock_guard guard(setup_mutex());
     (self->unrecorded_tail ? self->unrecorded_tail->next : self->unrecorded_head) = node;
@@ -1072,6 +1276,7 @@ void fail_unrecorded(Object* self)
     while (node) {
         Unrecorded* const next = node->next;
         fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value, node->bytes);
+        release_unrecorded(*node);
         delete node;
         node = next;
     }
@@ -1089,6 +1294,7 @@ void fail_waiting(Object* self, QueueWork* work)
             work->waiting.pop_front();
         }
         fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
+        release_entry(entry);
     }
 }
 
@@ -1217,11 +1423,58 @@ void complete_deferred(Object* self, QueueWork* work)
         }
         if (node) {
             fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value, node->bytes);
+            release_unrecorded(*node);
             delete node;
         } else {
             fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
+            release_entry(entry);
         }
     }
+}
+
+// Drops every entry that will never run and releases the objects those entries held. Called after the
+// worker has left, so no other thread touches the queue.
+void discard_entries(QueueWork* work) noexcept
+{
+    for (Entry& entry : work->waiting) release_entry(entry);
+    work->waiting.clear();
+    for (Entry& entry : work->submitted) release_entry(entry);
+    work->submitted.clear();
+    for (Entry& entry : work->failing) release_entry(entry);
+    work->failing.clear();
+    Unrecorded* node = work->deferred_head;
+    work->deferred_head = work->deferred_tail = nullptr;
+    while (node) {
+        Unrecorded* const next = node->next;
+        release_unrecorded(*node);
+        delete node;
+        node = next;
+    }
+    work->cached_streams.clear();
+}
+
+bool shutdown_queue(Object* self)
+{
+    QueueWork* work = self->work;
+    if (!work) return false;
+    bool on_worker;
+    {
+        const std::lock_guard guard(work->mutex);
+        work->stopping = true;
+        on_worker = work->worker_started && GetCurrentThreadId() == work->thread_id;
+        if (on_worker) work->destroy_on_worker = true;
+    }
+    work->wake.notify_all();
+    if (on_worker) return true;  // the worker frees the queue as it exits
+    if (work->thread) {
+        WaitForSingleObject(work->thread, INFINITE);
+        CloseHandle(work->thread);
+        work->thread = nullptr;
+    }
+    discard_entries(work);
+    self->work = nullptr;
+    delete work;
+    return false;
 }
 
 // Enqueue only records the entry, whether or not a worker runs; nothing completes before Submit.
@@ -1235,13 +1488,18 @@ void push(Object* self, Entry&& entry)
     start_worker(self, work);  // a failure shows at Submit
     bool recorded = false;
     bool full = false;
-    try {
+    {
         const std::lock_guard guard(work->mutex);
-        entry.id = ++work->next_entry_id;
-        work->waiting.push_back(std::move(entry));
-        recorded = true;
-        full = self->capacity && work->waiting.size() >= self->capacity;
-    } catch (const std::bad_alloc&) {
+        // The handler sits inside the lock's scope, like every other growth of these lists: a
+        // std::bad_alloc must not unwind through the guard (the MSVC build under test then leaves
+        // the mutex locked, and the next Submit throws std::system_error on its own lock).
+        try {
+            entry.id = ++work->next_entry_id;
+            work->waiting.push_back(std::move(entry));
+            recorded = true;
+            full = self->capacity && work->waiting.size() >= self->capacity;
+        } catch (const std::bad_alloc&) {
+        }
     }
     if (!recorded) {
         defer_unrecorded(self, entry);
@@ -1258,6 +1516,15 @@ void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
     entry.type = Entry::request;
     std::memcpy(entry.bytes, request, sizeof entry.bytes);
     const u64 options = *reinterpret_cast<const u64*>(request);
+    if (!(options & memory_source_option)) {
+        // The request keeps the file it reads alive until its turn: the guest may Release it after
+        // EnqueueRequest (#2788).
+        auto* source = *reinterpret_cast<Object* const*>(request + 0x20);
+        if (source && x2w_local::readable(source, sizeof(Object)) && source->kind == file) {
+            retain_entry_object(source);
+            entry.source = source;
+        }
+    }
     if (options & (1ull << 21)) {
         const auto* title = *reinterpret_cast<const ULONG_PTR* const*>(request + 0x08);
         const unsigned destination_size = *reinterpret_cast<const unsigned*>(request + 0x18);
@@ -1285,13 +1552,14 @@ void __stdcall queue_enqueue_status(Object* self, Object* array, unsigned index)
 {
     const bool valid = array && array->kind == status && index < array->capacity;
     static LONG calls;
-    if (!valid || InterlockedIncrement(&calls) <= 8)
+    if (!valid || x2w_local::first_calls(calls, 8))
         log("x2w-dstorage Queue::EnqueueStatus array=%p index=%u%s (requests done=%ld inflated=%ld failed=%ld)",
             static_cast<void*>(array), index, valid ? "" : " INVALID ARRAY", requests_done, requests_compressed, requests_failed);
     if (!valid) return;
     InterlockedExchange(&array->results[index], static_cast<LONG>(0x8000000A));  // E_PENDING until its turn
     Entry entry{};
     entry.type = Entry::status_entry;
+    retain_entry_object(array);
     entry.array = array;
     entry.index = index;
     push(self, std::move(entry));
@@ -1317,19 +1585,19 @@ void signal_fence(void* fence, u64 value)
         hr = reinterpret_cast<Signal>((*static_cast<void***>(fence))[10])(fence, value);
     }
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4)
+    if (x2w_local::first_calls(calls, 4))
         log("x2w-dstorage Queue::EnqueueSignal fence=%p value=0x%llx -> 0x%08lx", fence, value, static_cast<unsigned long>(hr));
 }
 void __stdcall queue_submit(Object* self, u64 rdx, u64 r8)
 {
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage Queue::Submit rdx=0x%llx r8=0x%llx", rdx, r8);
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage Queue::Submit rdx=0x%llx r8=0x%llx", rdx, r8);
     submit(self);
 }
 void __stdcall queue_cancel(Object*, u64 mask, u64 value)
 {
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage Queue::CancelRequestsWithTag mask=0x%llx value=0x%llx (no-op)", mask, value);
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage Queue::CancelRequestsWithTag mask=0x%llx value=0x%llx (no-op)", mask, value);
 }
 void __stdcall queue_close(Object*) { log("x2w-dstorage Queue::Close"); }
 // Slots 9 and 10 follow Microsoft's Xbox-GDK-Samples dstorage_win32.h. GetErrorEvent's
@@ -1347,7 +1615,7 @@ HANDLE __stdcall queue_error_event(Object* self)
                             0, FALSE, DUPLICATE_SAME_ACCESS);
     }
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage Queue::GetErrorEvent -> %p", event);
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage Queue::GetErrorEvent -> %p", event);
     return event;
 }
 void __stdcall queue_retrieve_error_record(Object* self, StorageErrorRecord* out)
@@ -1367,14 +1635,14 @@ bool __stdcall status_is_complete(Object* self, unsigned index)
 {
     const bool complete = index < self->capacity && self->results[index] != static_cast<LONG>(0x8000000A);
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage StatusArray::IsComplete index=%u -> %d", index, complete);
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage StatusArray::IsComplete index=%u -> %d", index, complete);
     return complete;
 }
 long __stdcall status_hresult(Object* self, unsigned index)
 {
     const long hr = index < self->capacity ? self->results[index] : E_INVALIDARG;
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage StatusArray::GetHResult index=%u -> 0x%08lx", index, static_cast<unsigned long>(hr));
+    if (x2w_local::first_calls(calls, 4)) log("x2w-dstorage StatusArray::GetHResult index=%u -> 0x%08lx", index, static_cast<unsigned long>(hr));
     return hr;
 }
 
@@ -1444,7 +1712,36 @@ MemorySample memory_sample() noexcept
     return sample;
 }
 
+// The heartbeat interval in ms: 10000 unless X2W_HEARTBEAT_INTERVAL_MS holds a whole number from 1000
+// to 10000. Only tests set it, to see a sample without waiting 10 s; anything else keeps the default.
+DWORD heartbeat_interval_ms() noexcept
+{
+    char text[16];
+    const DWORD length = GetEnvironmentVariableA("X2W_HEARTBEAT_INTERVAL_MS", text, sizeof(text));
+    if (length == 0 || length >= sizeof(text)) return 10000;
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(text, &end, 10);
+    return (*end == '\0' && value >= 1000 && value <= 10000) ? static_cast<DWORD>(value) : 10000;
+}
+
 }  // namespace
+
+// Fixture-only probes (#2788): objects alive by kind (0 = every kind) and running queue workers.
+extern "C" __declspec(dllexport) unsigned long x2w_xcrdapi_live_objects(unsigned kind)
+{
+    if (kind == 0) {
+        unsigned long total = 0;
+        for (LONG count : live_by_kind) total += static_cast<unsigned long>(count);
+        return total;
+    }
+    if (kind != factory && kind != file && kind != status && kind != queue) return 0;
+    return static_cast<unsigned long>(live_by_kind[kind / 0x20 - 1]);
+}
+
+extern "C" __declspec(dllexport) unsigned long x2w_xcrdapi_live_workers()
+{
+    return static_cast<unsigned long>(live_workers);
+}
 
 extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
 {
@@ -1464,8 +1761,10 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
     static HANDLE heartbeat = CreateThread(nullptr, 0, [](void*) -> DWORD {
         LONG last = -1;
         MemorySample last_memory;
-        for (int second = 10;; second += 10) {
-            Sleep(10000);
+        const DWORD interval_ms = heartbeat_interval_ms();
+        for (DWORD elapsed_ms = interval_ms;; elapsed_ms += interval_ms) {
+            const int second = static_cast<int>(elapsed_ms / 1000);
+            Sleep(interval_ms);
             // Sample the counters once for every line of this report, even while the worker is reporting
             // new failures.
             StorageFailureCounts failure_counts;
